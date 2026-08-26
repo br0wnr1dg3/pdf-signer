@@ -13,9 +13,8 @@ export function openSignaturePad() {
   const ctx = canvas.getContext('2d');
   const widthInput = document.getElementById('sig-width');
   let hasInk = false;
-  let uploaded = null; // data URL from upload, if any
 
-  const clear = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); hasInk = false; uploaded = null; };
+  const clear = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); hasInk = false; };
   clear();
   ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = '#111';
 
@@ -33,7 +32,7 @@ export function openSignaturePad() {
     const mid = { x: (last.x + p.x) / 2, y: (last.y + p.y) / 2 };
     ctx.lineWidth = parseFloat(widthInput.value) * (canvas.width / canvas.getBoundingClientRect().width);
     ctx.beginPath(); ctx.moveTo(prevMid.x, prevMid.y); ctx.quadraticCurveTo(last.x, last.y, mid.x, mid.y); ctx.stroke();
-    last = p; prevMid = mid; hasInk = true; uploaded = null;
+    last = p; prevMid = mid; hasInk = true;
   };
   const up = () => { drawing = false; };
 
@@ -47,7 +46,7 @@ export function openSignaturePad() {
         const s = Math.min(canvas.width / img.width, canvas.height / img.height);
         const w = img.width * s, h = img.height * s;
         ctx.drawImage(img, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
-        hasInk = true; uploaded = canvas.toDataURL('image/png');
+        hasInk = true;
       };
       img.src = reader.result;
     };
@@ -77,7 +76,7 @@ export function openSignaturePad() {
     document.getElementById('sig-cancel').onclick = cancel;
     document.getElementById('sig-save').onclick = () => {
       if (!hasInk) return;
-      const dataUrl = uploaded ?? trimmedPng(canvas);
+      const dataUrl = trimmedPng(canvas);
       localStorage.setItem(KEY, dataUrl);
       cleanup(); resolve(dataUrl);
     };
@@ -99,7 +98,7 @@ function trimmedPng(canvas) {
   if (maxX < 0) return canvas.toDataURL('image/png');
   const pad = 6;
   const sx = Math.max(0, minX - pad), sy = Math.max(0, minY - pad);
-  const sw = Math.min(width, maxX + pad) - sx, sh = Math.min(height, maxY + pad) - sy;
+  const sw = Math.min(width, maxX + 1 + pad) - sx, sh = Math.min(height, maxY + 1 + pad) - sy;
   const out = document.createElement('canvas'); out.width = sw; out.height = sh;
   out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
   return out.toDataURL('image/png');
