@@ -1029,6 +1029,37 @@ git add src/signaturePad.js src/app.js && git commit -m "feat: signature pad wit
 
 ```js
 import { FONT_SIZE_RATIO } from './geometry.js';
+import { showToast } from './toast.js';
+
+// The printable characters WinAnsi puts in 0x80-0x9F, which Latin-1 leaves empty. pdf-lib's
+// Helvetica encodes these; a plain "ASCII plus Latin-1" filter would throw them away.
+const WINANSI_HIGH = '\u20AC\u201A\u0192\u201E\u2026\u2020\u2021\u02C6\u2030\u0160\u2039\u0152\u017D'
+                   + '\u2018\u2019\u201C\u201D\u2022\u2013\u2014\u02DC\u2122\u0161\u203A\u0153\u017E\u0178';
+
+// Typography folded to ASCII first, so a pasted curly quote reads as a quote rather than as a
+// glyph the reader's PDF viewer has to find a font for.
+const FOLD = new Map(Object.entries({
+  '\u2018': "'", '\u2019': "'", '\u201A': "'", '\u201B': "'",
+  '\u201C': '"', '\u201D': '"', '\u201E': '"',
+  '\u2013': '-', '\u2014': '-', '\u2212': '-',
+  '\u2026': '...', '\u00A0': ' ',
+}));
+
+/**
+ * Fold what ASCII can express and drop only what Helvetica's WinAnsi encoding cannot represent
+ * at all, reporting how many characters were lost so the user can be told.
+ */
+export function sanitizeForHelvetica(text) {
+  let out = '', dropped = 0;
+  for (const ch of text) {              // by code point: an astral character counts once
+    const folded = FOLD.get(ch);
+    if (folded !== undefined) { out += folded; continue; }
+    const code = ch.codePointAt(0);
+    if ((code >= 0x20 && code <= 0x7E) || (code >= 0xA0 && code <= 0xFF) || WINANSI_HIGH.includes(ch)) out += ch;
+    else dropped++;
+  }
+  return { text: out, dropped };
+}
 
 const overlays = [];   // model, see plan header
 let selectedId = null;
@@ -1068,7 +1099,10 @@ export function clearOverlays() {
 export function addOverlay(type, pageInfo, value, imgAspect = 3) {
   const pw = pageInfo.viewport.width, ph = pageInfo.viewport.height;
   let w, h;
-  if (type === 'signature') { w = Math.min(180, pw * 0.4); h = w / imgAspect; }
+  if (type === 'signature') {
+    w = Math.min(180, pw * 0.4); h = w / imgAspect;
+    if (h > ph) { h = ph; w = h * imgAspect; }   // a very tall signature on a short page
+  }
   else { h = 22; w = type === 'date' ? 110 : 160; }
   // pageW/pageH come from the viewport, not the live element, so clamping survives a re-layout.
   const o = { id: `o${nextId++}`, page: pageInfo.index, type, x: (pw - w) / 2, y: (ph - h) / 2, w, h, value,
@@ -1197,12 +1231,11 @@ function attach(o, handle) {
     });
     o.el.addEventListener('blur', () => {
       o.el.contentEditable = 'false';
-      const clean = o.el.textContent
-        .replace(/\s+/g, ' ')                    // one line: pasted breaks and tabs become spaces
-        .replace(/[^\x20-\x7E\xA0-\xFF]/g, '')   // only what Helvetica/WinAnsi can encode, or the export throws
-        .replace(/ {2,}/g, ' ')                  // close the gaps the strip left behind
-        .trim();
+      // One line, then only what the export can encode; a dropped character is reported, never silent.
+      const { text, dropped } = sanitizeForHelvetica(o.el.textContent.replace(/\s+/g, ' '));
+      const clean = text.replace(/ {2,}/g, ' ').trim(); // close the gaps the drop left behind
       o.value = clean || o.value;
+      if (dropped > 0) showToast(`${dropped} character(s) can't be embedded in the PDF and were removed.`);
       o.el.textContent = o.value;
       o.el.appendChild(handle); // the handle is inside the editable box: editing drops it
       fitText(o);
@@ -1291,7 +1324,7 @@ export { state, todayString };
 
 - [ ] **Step 3: Verify in browser**
 
-Open a multi-page PDF, scroll to page 2, click + Signature: it appears centred on page 2, selected. Drag it; it can't leave the page. Resize keeps aspect. + Date shows today's date; toggling format then adding another date changes format. + Text → double-click → type → Enter commits. Delete key removes the selected overlay; Backspace while editing text does NOT delete the overlay. Clicking on the page background deselects. Opening a second PDF clears every overlay; a file that fails to parse leaves them alone. A 25-character name widens the box to fit with nothing clipped, and resizing a text overlay taller grows the font with the width following the glyphs. Right-clicking an overlay does not start a drag, and scrolling the wheel mid-drag leaves the overlay under the pointer. Pasting multi-line text lands as one line.
+Open a multi-page PDF, scroll to page 2, click + Signature: it appears centred on page 2, selected. Drag it; it can't leave the page. Resize keeps aspect. + Date shows today's date; toggling format then adding another date changes format. + Text → double-click → type → Enter commits. Delete key removes the selected overlay; Backspace while editing text does NOT delete the overlay. Clicking on the page background deselects. Opening a second PDF clears every overlay; a file that fails to parse leaves them alone. A 25-character name widens the box to fit with nothing clipped, and resizing a text overlay taller grows the font with the width following the glyphs. Right-clicking an overlay does not start a drag, and scrolling the wheel mid-drag leaves the overlay under the pointer. Pasting multi-line text lands as one line, curly quotes and dashes arrive folded to ASCII, and a character Helvetica cannot encode (漢, ☃) is dropped with a toast saying how many went.
 
 - [ ] **Step 4: Commit**
 
