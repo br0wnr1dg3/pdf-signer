@@ -289,10 +289,26 @@ pdf.js renders a page with a `scale` and a `rotation` (the page's `/Rotate` valu
 ```js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { toPdfRect, textLayout } from '../src/geometry.js';
+import { toPdfRect, textLayout, imageLayout, BASELINE_RATIO, FONT_SIZE_RATIO } from '../src/geometry.js';
 
 const close = (a, b, msg) => assert.ok(Math.abs(a - b) < 1e-6, `${msg}: ${a} vs ${b}`);
 const eqRect = (got, want) => { for (const k of ['x','y','w','h']) close(got[k], want[k], k); };
+const eqFields = (got, want) => { for (const k of Object.keys(want)) close(got[k], want[k], k); };
+
+/**
+ * Independent check of what pdf-lib will actually paint: rotate the drawn box CCW by
+ * `rotate` degrees about its (x, y) anchor and return the axis-aligned rect it sweeps.
+ * The width-axis points along `rotate`, the height-axis along `rotate + 90`.
+ */
+const footprint = ({ x, y, width, height, rotate }) => {
+  const th = (rotate * Math.PI) / 180;
+  const cos = Math.round(Math.cos(th)), sin = Math.round(Math.sin(th)); // exact at multiples of 90
+  const pts = [[0, 0], [width, 0], [0, height], [width, height]]
+    .map(([u, v]) => [x + u * cos - v * sin, y + u * sin + v * cos]);
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const minX = Math.min(...xs), minY = Math.min(...ys);
+  return { x: minX, y: minY, w: Math.max(...xs) - minX, h: Math.max(...ys) - minY };
+};
 
 // Unrotated 200x400pt page rendered at scale 2 → 400x800 css px
 const vp0 = { scale: 2, rotation: 0, width: 400, height: 800, pdfWidth: 200, pdfHeight: 400 };
@@ -329,15 +345,111 @@ test('rotation 270: top-left of rendered image is top-right of unrotated page', 
   eqRect(toPdfRect({ x: 0, y: 0, w: 40, h: 20 }, vp270), { x: 180, y: 360, w: 20, h: 40 });
 });
 
+// --- interior rects at scale 2, to catch sign errors the corner cases can hide ---
+
+const vp180s2 = { scale: 2, rotation: 180, width: 400, height: 800, pdfWidth: 200, pdfHeight: 400 };
+test('rotation 180: interior rect at scale 2', () => {
+  // css (60,100) 80x40 → pts (30,50) 40x20. Image-left edge maps to page-right, image-top to page-bottom:
+  // x = pdfWidth - (30 + 40) = 130, y = 50 (already measured from the page bottom), w/h unswapped.
+  eqRect(toPdfRect({ x: 60, y: 100, w: 80, h: 40 }, vp180s2), { x: 130, y: 50, w: 40, h: 20 });
+});
+
+const vp270s2 = { scale: 2, rotation: 270, width: 800, height: 400, pdfWidth: 200, pdfHeight: 400 };
+test('rotation 270: interior rect at scale 2', () => {
+  // css (60,100) 80x40 → pts (30,50) 40x20. Image-left edge maps to page-top, image-top to page-right:
+  // x = pdfWidth  - (50 + 20) = 130, y = pdfHeight - (30 + 40) = 330, w/h swapped → 20x40.
+  eqRect(toPdfRect({ x: 60, y: 100, w: 80, h: 40 }, vp270s2), { x: 130, y: 330, w: 20, h: 40 });
+});
+
+// --- whole-page invariant ---
+
+test('a rect covering the whole rendered image is the whole page, at every rotation', () => {
+  for (const vp of [vp0, vp90, vp180, vp270, vp180s2, vp270s2]) {
+    const got = toPdfRect({ x: 0, y: 0, w: vp.width, h: vp.height }, vp);
+    eqRect(got, { x: 0, y: 0, w: vp.pdfWidth, h: vp.pdfHeight });
+  }
+});
+
+// --- validation and normalization ---
+
 test('toPdfRect rejects unknown rotation', () => {
   assert.throws(() => toPdfRect({ x:0, y:0, w:1, h:1 }, { ...vp0, rotation: 45 }), /rotation/);
 });
 
-test('textLayout: font size is 80% of box height and baseline sits 0.43·fontSize above the bottom', () => {
+test('toPdfRect rejects a non-positive or missing scale', () => {
+  assert.throws(() => toPdfRect({ x:0, y:0, w:1, h:1 }, { ...vp0, scale: 0 }), /scale/);
+  assert.throws(() => toPdfRect({ x:0, y:0, w:1, h:1 }, { ...vp0, scale: undefined }), /scale/);
+});
+
+test('rotation is normalized into [0, 360)', () => {
+  // -90 is 270, 450 is 90 — same answers as the plain fixtures above.
+  eqRect(toPdfRect({ x: 0, y: 0, w: 40, h: 20 }, { ...vp270, rotation: -90 }), { x: 180, y: 360, w: 20, h: 40 });
+  eqRect(toPdfRect({ x: 0, y: 0, w: 40, h: 20 }, { ...vp90, rotation: 450 }), { x: 0, y: 0, w: 10, h: 20 });
+  eqFields(imageLayout({ x: 10, y: 20, w: 40, h: 30 }, -90), imageLayout({ x: 10, y: 20, w: 40, h: 30 }, 270));
+  eqFields(textLayout({ x: 10, y: 20, w: 40, h: 30 }, 450), textLayout({ x: 10, y: 20, w: 40, h: 30 }, 90));
+});
+
+test('imageLayout and textLayout reject unknown rotations', () => {
+  assert.throws(() => imageLayout({ x:0, y:0, w:1, h:1 }, 45), /rotation/);
+  assert.throws(() => textLayout({ x:0, y:0, w:1, h:1 }, 45), /rotation/);
+});
+
+// --- ratios ---
+
+test('layout ratios are the calibrated constants', () => {
+  close(BASELINE_RATIO, 0.43, 'BASELINE_RATIO');
+  close(FONT_SIZE_RATIO, 0.8, 'FONT_SIZE_RATIO');
+});
+
+// --- imageLayout ---
+
+const r = { x: 10, y: 20, w: 40, h: 30 };
+
+test('imageLayout: anchor and size per rotation', () => {
+  eqFields(imageLayout(r, 0),   { x: 10, y: 20, width: 40, height: 30, rotate: 0 });
+  eqFields(imageLayout(r, 90),  { x: 50, y: 20, width: 30, height: 40, rotate: 90 });
+  eqFields(imageLayout(r, 180), { x: 50, y: 50, width: 40, height: 30, rotate: 180 });
+  eqFields(imageLayout(r, 270), { x: 10, y: 50, width: 30, height: 40, rotate: 270 });
+});
+
+test('imageLayout: the rotated image sweeps exactly the target rect', () => {
+  for (const rotation of [0, 90, 180, 270]) {
+    const got = footprint(imageLayout(r, rotation));
+    eqRect(got, r);
+  }
+});
+
+test('imageLayout defaults to rotation 0', () => {
+  eqFields(imageLayout(r), { x: 10, y: 20, width: 40, height: 30, rotate: 0 });
+});
+
+// --- textLayout ---
+
+test('textLayout: font size is 80% of the box thickness and the baseline sits 0.43·size inside it', () => {
+  // rotation 0: text runs along +x, ascends toward +y → thickness is r.h = 30, size = 24, pad = 10.32
+  eqFields(textLayout(r, 0), { x: 10, y: 20 + 24 * 0.43, size: 24, rotate: 0 });
+  // rotation 90: text runs along +y, ascends toward -x → thickness is r.w = 40, size = 32, pad = 13.76
+  eqFields(textLayout(r, 90), { x: 10 + 40 - 32 * 0.43, y: 20, size: 32, rotate: 90 });
+  // rotation 180: runs along -x from the right edge, ascends toward -y → size 24
+  eqFields(textLayout(r, 180), { x: 10 + 40, y: 20 + 30 - 24 * 0.43, size: 24, rotate: 180 });
+  // rotation 270: runs along -y from the top edge, ascends toward +x → size 32
+  eqFields(textLayout(r, 270), { x: 10 + 32 * 0.43, y: 20 + 30, size: 32, rotate: 270 });
+});
+
+test('textLayout defaults to rotation 0', () => {
   const t = textLayout({ x: 10, y: 100, w: 80, h: 20 });
-  close(t.fontSize, 16, 'fontSize');
+  close(t.size, 16, 'size');
   close(t.x, 10, 'x');
-  close(t.baselineY, 100 + 16 * 0.43, 'baselineY');
+  close(t.y, 100 + 16 * 0.43, 'y');
+  close(t.rotate, 0, 'rotate');
+});
+
+test('textLayout: the baseline start stays inside the target rect at every rotation', () => {
+  for (const rotation of [0, 90, 180, 270]) {
+    const t = textLayout(r, rotation);
+    assert.ok(t.x >= r.x && t.x <= r.x + r.w, `x in rect at ${rotation}: ${t.x}`);
+    assert.ok(t.y >= r.y && t.y <= r.y + r.h, `y in rect at ${rotation}: ${t.y}`);
+  }
 });
 ```
 
@@ -349,14 +461,31 @@ Expected: FAIL — `Cannot find module '.../src/geometry.js'`
 - [ ] **Step 3: Implement**
 
 ```js
+/** Fraction of the font size between the box bottom and the text baseline (matches the CSS preview). */
+export const BASELINE_RATIO = 0.43;
+
+/** Font size as a fraction of the text box's thickness, so Helvetica's ascender fits inside. */
+export const FONT_SIZE_RATIO = 0.8;
+
+/** Accept any multiple of 90 (including negatives) and reduce it to 0 | 90 | 180 | 270. */
+function normalizeRotation(rotation) {
+  const r = ((rotation % 360) + 360) % 360;
+  if (![0, 90, 180, 270].includes(r)) throw new Error(`Unsupported page rotation: ${r}`);
+  return r;
+}
+
 /**
  * Convert a rect in rendered CSS pixels (origin top-left, Y down, on the ROTATED page image)
  * into unrotated PDF points (origin bottom-left, Y up) for pdf-lib.
  *
- * viewport: { scale, rotation (0|90|180|270), width, height, pdfWidth, pdfHeight }
+ * viewport: { scale, rotation (0|90|180|270), pdfWidth, pdfHeight } — the rendered
+ * width/height are implied by scale and rotation, so they are not read here.
  */
 export function toPdfRect(rect, viewport) {
-  const { scale, rotation, pdfWidth, pdfHeight } = viewport;
+  const { scale, pdfWidth, pdfHeight } = viewport;
+  if (!Number.isFinite(scale) || scale <= 0) throw new Error(`Invalid scale: ${scale}`);
+  const rotation = normalizeRotation(viewport.rotation);
+
   // 1. CSS px → points, still in rotated-image space with origin top-left.
   const x = rect.x / scale, y = rect.y / scale, w = rect.w / scale, h = rect.h / scale;
   // Rotated image size in points:
@@ -365,34 +494,72 @@ export function toPdfRect(rect, viewport) {
 
   // 2. Map the rect's corners from rotated top-left space to unrotated bottom-left space.
   // Work with the rect's four corners so w/h swap falls out naturally.
-  const corners = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].map(([px, py]) => {
-    switch (rotation) {
-      case 0:   return [px, rh - py];
-      case 90:  return [py, px];                 // image-left edge = page-bottom, image-top edge = page-left
-      case 180: return [rw - px, py];
-      case 270: return [rh - py, rw - px];
-      default:  throw new Error(`Unsupported page rotation: ${rotation}`);
-    }
-  });
+  const mapPoint = {
+    0:   ([px, py]) => [px, rh - py],
+    90:  ([px, py]) => [py, px],           // image-left edge = page-bottom, image-top edge = page-left
+    180: ([px, py]) => [rw - px, py],      // image-left edge = page-right,  image-top edge = page-bottom
+    270: ([px, py]) => [rh - py, rw - px], // image-left edge = page-top,    image-top edge = page-right
+  }[rotation];
+
+  const corners = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].map(mapPoint);
   const xs = corners.map(c => c[0]), ys = corners.map(c => c[1]);
   const minX = Math.min(...xs), minY = Math.min(...ys);
   return { x: minX, y: minY, w: Math.max(...xs) - minX, h: Math.max(...ys) - minY };
 }
 
-/** Fraction of the font size between the box bottom and the text baseline (matches the CSS preview). */
-export const BASELINE_RATIO = 0.43;
+/**
+ * Args for pdf-lib's `page.drawImage` that paint the image into `pdfRect` (unrotated page
+ * points) turned `rotation`° so it reads upright once the viewer applies the page's /Rotate.
+ *
+ * pdf-lib rotates counter-clockwise about the (x, y) anchor, mapping the image's width-axis
+ * to `rotation` and its height-axis to `rotation + 90`; the anchor corner below is the one
+ * that makes the swept rect exactly `pdfRect`. `rotate` is degrees — wrap it in `degrees()`.
+ */
+export function imageLayout(pdfRect, rotation = 0) {
+  const rot = normalizeRotation(rotation);
+  const r = pdfRect;
+  return {
+    ...{
+      0:   { x: r.x,       y: r.y,       width: r.w, height: r.h },
+      90:  { x: r.x + r.w, y: r.y,       width: r.h, height: r.w },
+      180: { x: r.x + r.w, y: r.y + r.h, width: r.w, height: r.h },
+      270: { x: r.x,       y: r.y + r.h, width: r.h, height: r.w },
+    }[rot],
+    rotate: rot,
+  };
+}
 
-/** Given a PDF-point rect for a text box, return the font size and baseline for pdf-lib drawText. */
-export function textLayout(pdfRect) {
-  const fontSize = pdfRect.h * 0.8;
-  return { fontSize, x: pdfRect.x, baselineY: pdfRect.y + fontSize * BASELINE_RATIO };
+/**
+ * Args for pdf-lib's `page.drawText` that fit a single line into `pdfRect` (unrotated page
+ * points) turned `rotation`° so it reads upright once the viewer applies the page's /Rotate.
+ *
+ * The anchor is the baseline start. Text runs along `rotation` and ascends toward
+ * `rotation + 90`, so the box thickness that sets the font size is the rect's height at
+ * 0/180 and its width at 90/270, and the baseline sits `size * BASELINE_RATIO` in from
+ * whichever edge is "below" the text. `rotate` is degrees — wrap it in `degrees()`.
+ */
+export function textLayout(pdfRect, rotation = 0) {
+  const rot = normalizeRotation(rotation);
+  const r = pdfRect;
+  const size = ((rot === 90 || rot === 270) ? r.w : r.h) * FONT_SIZE_RATIO;
+  const pad = size * BASELINE_RATIO;
+  return {
+    ...{
+      0:   { x: r.x,             y: r.y + pad },
+      90:  { x: r.x + r.w - pad, y: r.y },
+      180: { x: r.x + r.w,       y: r.y + r.h - pad },
+      270: { x: r.x + pad,       y: r.y + r.h },
+    }[rot],
+    size,
+    rotate: rot,
+  };
 }
 ```
 
 - [ ] **Step 4: Run tests**
 
 Run: `npm test`
-Expected: all 8 tests pass. If a rotation case fails, re-derive: with rotation 90 (clockwise), the rendered image's left edge corresponds to the unrotated page's bottom edge and its top edge to the page's left edge, so `(px, py) → (py, px)`.
+Expected: all 20 tests pass. If a rotation case fails, re-derive: with rotation 90 (clockwise), the rendered image's left edge corresponds to the unrotated page's bottom edge and its top edge to the page's left edge, so `(px, py) → (py, px)`.
 
 - [ ] **Step 5: Commit**
 
@@ -861,7 +1028,7 @@ git add src/overlays.js src/app.js && git commit -m "feat: draggable, resizable,
 - [ ] **Step 1: Implement exporter.js**
 
 ```js
-import { toPdfRect, textLayout, BASELINE_RATIO } from './geometry.js';
+import { toPdfRect, textLayout, imageLayout } from './geometry.js';
 
 /**
  * bytes: Uint8Array of the original PDF
@@ -870,7 +1037,7 @@ import { toPdfRect, textLayout, BASELINE_RATIO } from './geometry.js';
  * Returns Uint8Array of the signed PDF.
  */
 export async function buildSignedPdf(bytes, overlays, pages) {
-  const { PDFDocument, StandardFonts, rgb } = window.PDFLib;
+  const { PDFDocument, StandardFonts, rgb, degrees } = window.PDFLib;
   const doc = await PDFDocument.load(bytes, { ignoreEncryption: false });
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const pdfPages = doc.getPages();
@@ -883,40 +1050,14 @@ export async function buildSignedPdf(bytes, overlays, pages) {
     if (o.type === 'signature') {
       let img = imageCache.get(o.value);
       if (!img) { img = await doc.embedPng(o.value); imageCache.set(o.value, img); }
-      page.drawImage(img, { x: r.x, y: r.y, width: r.w, height: r.h, rotate: window.PDFLib.degrees(vp.rotation) , ...anchorForRotation(r, vp.rotation) });
+      const l = imageLayout(r, vp.rotation);
+      page.drawImage(img, { x: l.x, y: l.y, width: l.width, height: l.height, rotate: degrees(l.rotate) });
     } else {
-      const t = textLayout(r);
-      const opts = { x: t.x, y: t.baselineY, size: t.fontSize, font, color: rgb(0, 0, 0), rotate: window.PDFLib.degrees(vp.rotation) };
-      Object.assign(opts, textAnchorForRotation(r, t, vp.rotation));
-      page.drawText(o.value, opts);
+      const l = textLayout(r, vp.rotation);
+      page.drawText(o.value, { x: l.x, y: l.y, size: l.size, font, color: rgb(0, 0, 0), rotate: degrees(l.rotate) });
     }
   }
   return doc.save();
-}
-
-/**
- * pdf-lib rotates images/text about their (x, y) anchor. For rotated pages the content
- * must be rotated to match the page's /Rotate so it reads upright on screen, which
- * changes which corner of the target rect is the anchor.
- * For rotation 0 the anchor is bottom-left (default) so we return {}.
- */
-function anchorForRotation(r, rotation) {
-  switch (rotation) {
-    case 0:   return {};
-    case 90:  return { x: r.x + r.w, y: r.y,        width: r.h, height: r.w };
-    case 180: return { x: r.x + r.w, y: r.y + r.h };
-    case 270: return { x: r.x,       y: r.y + r.h,  width: r.h, height: r.w };
-  }
-}
-
-function textAnchorForRotation(r, t, rotation) {
-  const size = t.fontSize, pad = size * BASELINE_RATIO;
-  switch (rotation) {
-    case 0:   return {};
-    case 90:  return { x: r.x + r.w - pad, y: r.y,         size: r.w * 0.8 };
-    case 180: return { x: r.x + r.w,       y: r.y + r.h - pad };
-    case 270: return { x: r.x + pad,       y: r.y + r.h,   size: r.w * 0.8 };
-  }
 }
 
 export function downloadBytes(bytes, filename) {
@@ -932,7 +1073,7 @@ export function signedName(original) {
 }
 ```
 
-Rotation note for the implementer: on a page with `/Rotate 90`, the viewer turns the page 90° clockwise. `toPdfRect` already gives the target rect in unrotated space (with w/h swapped for 90/270). For the drawn content to read upright in the viewer it must be drawn rotated by the same 90°; pdf-lib rotates counter-clockwise about the anchor, so the anchor becomes the bottom-right corner of the unrotated rect with `width = r.h`, `height = r.w` — that is what `anchorForRotation` returns. Verify visually with `samples/rotated90.pdf` (Task 7); if the signature lands mirrored/off-page, the anchor corner is wrong — try the other three corners rather than changing `geometry.js` (which is unit-tested).
+Rotation handling is entirely inside geometry.js (unit-tested). If Task 7's visual check on rotated90.pdf is wrong, fix `imageLayout`/`textLayout` and their tests, not the exporter.
 
 - [ ] **Step 2: Wire Save in app.js**
 
@@ -972,7 +1113,7 @@ git add src/exporter.js src/app.js && git commit -m "feat: export signed PDF wit
 
 **Files:**
 - Create: `samples/make-samples.mjs`, `samples/portrait.pdf`, `samples/landscape.pdf`, `samples/rotated90.pdf`
-- Modify: `README.md`, `src/exporter.js` (only if rotated output is wrong)
+- Modify: `README.md`, `src/geometry.js` (only if rotated output is wrong)
 
 - [ ] **Step 1: Sample generator (uses the vendored pdf-lib UMD bundle from node)**
 
@@ -1009,7 +1150,7 @@ Run: `npm run samples` → three PDFs written. Open `rotated90.pdf` in Preview: 
 
 - [ ] **Step 2: Verify rotated export**
 
-In the app, open `samples/rotated90.pdf`, place a signature over the "Signature:" line, and a date over "Date:", save, open in Preview. The items must sit on those lines, upright relative to the page text. If not, adjust the anchor corner in `anchorForRotation`/`textAnchorForRotation` in `src/exporter.js` (see rotation note in Task 6) until correct, and re-test 0° with `portrait.pdf` to be sure nothing regressed. Do the same with `landscape.pdf` (rotation 0, wide page).
+In the app, open `samples/rotated90.pdf`, place a signature over the "Signature:" line, and a date over "Date:", save, open in Preview. The items must sit on those lines, upright relative to the page text. If not, adjust `imageLayout`/`textLayout` in `src/geometry.js` and their tests (see rotation note in Task 6) until correct, and re-test 0° with `portrait.pdf` to be sure nothing regressed. Do the same with `landscape.pdf` (rotation 0, wide page).
 
 - [ ] **Step 3: README manual checklist**
 
