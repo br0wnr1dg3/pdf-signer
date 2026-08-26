@@ -18,9 +18,9 @@ No backend, no build step, no network. Opened via `python3 -m http.server` (need
 |---|---|---|
 | `pdfView.js` | Load a `File`, render each page to a `<canvas>` inside `.page` wrappers, reporting each page as it appears; expose per-page viewport (scale, rotation, rendered size, unrotated page size and CropBox origin in PDF points). Destroys the previous document (and its worker) before loading the next, and ignores superseded loads. | `loadPdf(file, container, onPage?) → {bytes, pages: [{index, el, canvas, viewport}]}`, `closePdf()` |
 | `signaturePad.js` | Modal with drawing canvas (pointer events, smoothed quadratic strokes, pen width, clear), image upload, save/cancel. Persists PNG data URL to `localStorage['pdf-signer:signature']`. | `openSignaturePad() → Promise<dataUrl|null>`, `getSavedSignature()` |
-| `overlays.js` | Create/move/resize/edit/delete overlay elements (`signature`, `date`, `text`) positioned in CSS pixels relative to a page wrapper. Keeps a model array `{id, page, type, x, y, w, h, value}`. | `addOverlay(type, page)`, `getOverlays()`, `removeOverlay(id)` |
+| `overlays.js` | Create/move/resize/edit/delete overlay elements (`signature`, `date`, `text`) positioned in CSS pixels relative to a page wrapper. Keeps a model array `{id, page, type, x, y, w, h, value}`. | `addOverlay(type, pageInfo, value, imgAspect?)`, `getOverlays()`, `removeOverlay(id)`, `removeSelected()`, `clearOverlays()`, `deselect()`, `initOverlayGlobals()` |
 | `geometry.js` | Pure functions: CSS-pixel rect on a rendered page → PDF-point rect (flip Y, divide by scale, handle page rotation 0/90/180/270). No DOM. | `toPdfRect(rect, viewport) → {x, y, w, h}` |
-| `exporter.js` | Uses pdf-lib: load original bytes, for each overlay embed PNG or draw Helvetica text at `toPdfRect(...)`, save, trigger download `<name>-signed.pdf`. | `exportSigned(originalBytes, overlays, viewports, filename)` |
+| `exporter.js` | Uses pdf-lib: load original bytes, for each overlay embed PNG or draw Helvetica text at `toPdfRect(...)`, save, trigger download `<name>-signed.pdf`. | `buildSignedPdf(bytes, overlays, pages) → Uint8Array`, `downloadBytes(bytes, filename)`, `signedName(original)` |
 | `app.js` | Wires UI: file input/drag-drop, toolbar buttons (Sign, Add signature, Add date, Add text, Save), keyboard (Delete removes selected overlay). | — |
 
 ## Data flow
