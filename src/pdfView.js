@@ -61,6 +61,7 @@ export async function loadPdf(file, container, onPage) {
   const previous = currentTask;
   currentTask = loadingTask;
   if (previous) await previous.destroy().catch(() => {});
+  abortIfSuperseded(); // the destroy above was an await window
 
   container.innerHTML = '';
   const pages = [];

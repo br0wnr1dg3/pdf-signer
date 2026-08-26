@@ -27,8 +27,9 @@ async function openFile(file) {
     showToast('That is not a PDF.'); return;
   }
   loading = true;
-  // Nothing on screen changes until the first page renders, so a file that fails to parse
-  // leaves the document already open untouched.
+  setEditingEnabled(false); // no editing or saving while a load is in flight
+  // Nothing else on screen changes until the first page renders, so a file that fails to
+  // parse leaves the document already open untouched.
   let shown = false;
   try {
     const { bytes, pages } = await loadPdf(file, $('pages'), (page, numPages) => {
@@ -36,7 +37,6 @@ async function openFile(file) {
         shown = true;
         $('drop-zone').hidden = true;
         $('pages').hidden = false;
-        setEditingEnabled(false);
       }
       $('file-name').textContent = `${file.name} — loading page ${page.index + 1}/${numPages}…`;
     });
@@ -51,7 +51,8 @@ async function openFile(file) {
       showToast("Couldn't render this PDF.");
       return;
     }
-    // 'encrypted' / 'invalid': nothing was touched, so just say so.
+    // 'encrypted' / 'invalid': nothing was touched, so hand the previous document back.
+    setEditingEnabled(!!state.file);
     showToast(err.message === 'encrypted'
       ? "Couldn't open this PDF (it's password-protected)."
       : "Couldn't open this PDF (encrypted or corrupted).");
