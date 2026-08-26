@@ -27,7 +27,7 @@ Run `npm run samples` first.
 | 4 | Drag to a corner; drag past edge | Stays inside the page |
 | 5 | Resize via blue handle | Aspect ratio preserved |
 | 6 | + Date, toggle format, + Date again | Two dates, different formats |
-| 7 | + Text, double-click, type "Chris", Enter | Text updated; Backspace while editing does not delete box |
+| 7 | + Text, double-click, type "Hello", Enter | Text updated; Backspace while editing does not delete box |
 | 8 | Select overlay, press Delete | Removed |
 | 9 | Save signed PDF, open in Preview | Items at placed positions/sizes; original untouched |
 | 10 | Repeat 3–9 with `samples/landscape.pdf` | Same |
