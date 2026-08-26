@@ -1404,13 +1404,16 @@ git add src/exporter.js src/app.js && git commit -m "feat: export signed PDF wit
 
 ```js
 // node samples/make-samples.mjs
-import { createRequire } from 'node:module';
-import { writeFileSync } from 'node:fs';
+// package.json has "type":"module", so node would treat the vendored UMD .js as ESM
+// (ReferenceError: self is not defined). Evaluate it as CommonJS explicitly instead.
+import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-const require = createRequire(import.meta.url);
-const { PDFDocument, StandardFonts, degrees } = require('../vendor/pdf-lib.min.js');
 const here = dirname(fileURLToPath(import.meta.url));
+const umd = readFileSync(join(here, '../vendor/pdf-lib.min.js'), 'utf8');
+const mod = { exports: {} };
+new Function('module', 'exports', 'self', umd)(mod, mod.exports, globalThis);
+const { PDFDocument, StandardFonts, degrees, rgb } = mod.exports;
 
 async function make(name, { width, height, rotate = 0, pages = 2 }) {
   const doc = await PDFDocument.create();
@@ -1418,9 +1421,10 @@ async function make(name, { width, height, rotate = 0, pages = 2 }) {
   for (let i = 1; i <= pages; i++) {
     const p = doc.addPage([width, height]);
     if (rotate) p.setRotation(degrees(rotate));
+    // Border first (pdf-lib fills rectangles black by default — set an explicit white fill).
+    p.drawRectangle({ x: 20, y: 20, width: width - 40, height: height - 40, borderWidth: 1, color: rgb(1, 1, 1), borderColor: rgb(0, 0, 0) });
     p.drawText(`${name} — page ${i}`, { x: 40, y: height - 60, size: 20, font });
     p.drawText('Signature: ______________________   Date: __________', { x: 40, y: 80, size: 12, font });
-    p.drawRectangle({ x: 20, y: 20, width: width - 40, height: height - 40, borderWidth: 1 });
   }
   writeFileSync(join(here, `${name}.pdf`), await doc.save());
   console.log('wrote', `${name}.pdf`);
