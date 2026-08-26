@@ -1352,7 +1352,32 @@ export async function buildSignedPdf(bytes, overlays, pages, failures = []) {
       failures.push({ id: o.id, type: o.type, error: err });
     }
   }
-  return doc.save();
+  // One tick: the Save button is disabled for the whole export, so yielding buys nothing.
+  return doc.save({ objectsPerTick: Infinity });
+}
+
+/**
+ * pdf-lib's "this document is encrypted" error. The vendored bundle is minified, so every error
+ * class reports `name === 'Error'`: identify it by constructor, with the message as a fallback.
+ */
+export function isEncryptedPdfError(err) {
+  const Ctor = window.PDFLib.EncryptedPDFError;
+  return (!!Ctor && err instanceof Ctor) || /is encrypted/.test(err?.message ?? '');
+}
+
+/**
+ * False only for a PDF pdf-lib refuses to open at all: owner-password ("restricted") files,
+ * which pdf.js renders happily and pdf-lib rejects as encrypted. Any other load failure returns
+ * true and is left to surface at export time with its own message.
+ */
+export async function canEditPdf(bytes) {
+  const { PDFDocument } = window.PDFLib;
+  try {
+    await PDFDocument.load(bytes, { ignoreEncryption: false });
+    return true;
+  } catch (err) {
+    return !isEncryptedPdfError(err);
+  }
 }
 
 export function downloadBytes(bytes, filename) {
@@ -1372,26 +1397,28 @@ Rotation handling is entirely inside geometry.js (unit-tested). If Task 7's visu
 
 - [ ] **Step 2: Wire Save in app.js**
 
-Add `import { buildSignedPdf, downloadBytes, signedName } from './exporter.js';`, add `commitEdits` to the `overlays.js` import, and:
+Add `import { buildSignedPdf, downloadBytes, signedName, canEditPdf, isEncryptedPdfError } from './exporter.js';`, add `commitEdits` to the `overlays.js` import, guard `openFile` right after `loadPdf` resolves with `if (!(await canEditPdf(bytes))) { await closePdf(); showEmptyState(); showToast('This PDF has security restrictions that prevent editing.'); return; }` (pdf.js renders owner-password PDFs that pdf-lib refuses to open), and:
 
 ```js
 $('btn-save').addEventListener('click', async () => {
   commitEdits(); // an edit still in progress must reach the model before we read it
   const overlays = getOverlays();
   if (overlays.length === 0) { showToast('Nothing to save — add a signature first.'); return; }
+  const name = signedName(state.file.name); // read before the await: the document may be gone after it
   $('btn-save').disabled = true;
   try {
     const failures = [];
     const out = await buildSignedPdf(state.bytes, overlays, state.pages, failures);
-    downloadBytes(out, signedName(state.file.name));
-    showToast(failures.length
-      ? `Saved signed PDF — ${failures.length} item(s) could not be drawn.`
-      : 'Saved signed PDF to Downloads.');
+    downloadBytes(out, name);
+    if (failures.length) showToast(`Saved signed PDF — ${failures.length} item(s) could not be drawn.`, 8000);
+    else showToast('Saved signed PDF to Downloads.');
   } catch (err) {
     console.error(err);
-    showToast(`Export failed: ${err.message}`);
+    showToast(isEncryptedPdfError(err)
+      ? 'This PDF has security restrictions that prevent editing.'
+      : `Export failed: ${String(err?.message ?? err)}`);
   } finally {
-    $('btn-save').disabled = false;
+    $('btn-save').disabled = !state.file; // the document may have been closed while we were saving
   }
 });
 ```

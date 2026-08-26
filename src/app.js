@@ -2,7 +2,7 @@ import { showToast } from './toast.js';
 import { loadPdf, closePdf } from './pdfView.js';
 import { openSignaturePad, getSavedSignature } from './signaturePad.js';
 import { addOverlay, initOverlayGlobals, getOverlays, clearOverlays, commitEdits } from './overlays.js';
-import { buildSignedPdf, downloadBytes, signedName } from './exporter.js';
+import { buildSignedPdf, downloadBytes, signedName, canEditPdf, isEncryptedPdfError } from './exporter.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { file: null, bytes: null, pages: [] };
@@ -45,6 +45,14 @@ async function openFile(file) {
       }
       $('file-name').textContent = `${file.name} — loading page ${page.index + 1}/${numPages}…`;
     });
+    // pdf.js renders owner-password ("restricted") PDFs, pdf-lib refuses to open them: catch that
+    // here rather than letting the user place overlays that could never be saved.
+    if (!(await canEditPdf(bytes))) {
+      await closePdf();
+      showEmptyState();
+      showToast('This PDF has security restrictions that prevent editing.');
+      return;
+    }
     Object.assign(state, { file, bytes, pages });
     $('file-name').textContent = file.name;
     setEditingEnabled(true);
@@ -145,19 +153,21 @@ $('btn-save').addEventListener('click', async () => {
   commitEdits(); // an edit still in progress must reach the model before we read it
   const overlays = getOverlays();
   if (overlays.length === 0) { showToast('Nothing to save — add a signature first.'); return; }
+  const name = signedName(state.file.name); // read before the await: the document may be gone after it
   $('btn-save').disabled = true;
   try {
     const failures = [];
     const out = await buildSignedPdf(state.bytes, overlays, state.pages, failures);
-    downloadBytes(out, signedName(state.file.name));
-    showToast(failures.length
-      ? `Saved signed PDF — ${failures.length} item(s) could not be drawn.`
-      : 'Saved signed PDF to Downloads.');
+    downloadBytes(out, name);
+    if (failures.length) showToast(`Saved signed PDF — ${failures.length} item(s) could not be drawn.`, 8000);
+    else showToast('Saved signed PDF to Downloads.');
   } catch (err) {
     console.error(err);
-    showToast(`Export failed: ${err.message}`);
+    showToast(isEncryptedPdfError(err)
+      ? 'This PDF has security restrictions that prevent editing.'
+      : `Export failed: ${String(err?.message ?? err)}`);
   } finally {
-    $('btn-save').disabled = false;
+    $('btn-save').disabled = !state.file; // the document may have been closed while we were saving
   }
 });
 

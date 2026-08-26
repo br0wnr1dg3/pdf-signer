@@ -38,7 +38,32 @@ export async function buildSignedPdf(bytes, overlays, pages, failures = []) {
       failures.push({ id: o.id, type: o.type, error: err });
     }
   }
-  return doc.save();
+  // One tick: the Save button is disabled for the whole export, so yielding buys nothing.
+  return doc.save({ objectsPerTick: Infinity });
+}
+
+/**
+ * pdf-lib's "this document is encrypted" error. The vendored bundle is minified, so every error
+ * class reports `name === 'Error'`: identify it by constructor, with the message as a fallback.
+ */
+export function isEncryptedPdfError(err) {
+  const Ctor = window.PDFLib.EncryptedPDFError;
+  return (!!Ctor && err instanceof Ctor) || /is encrypted/.test(err?.message ?? '');
+}
+
+/**
+ * False only for a PDF pdf-lib refuses to open at all: owner-password ("restricted") files,
+ * which pdf.js renders happily and pdf-lib rejects as encrypted. Any other load failure returns
+ * true and is left to surface at export time with its own message.
+ */
+export async function canEditPdf(bytes) {
+  const { PDFDocument } = window.PDFLib;
+  try {
+    await PDFDocument.load(bytes, { ignoreEncryption: false });
+    return true;
+  } catch (err) {
+    return !isEncryptedPdfError(err);
+  }
 }
 
 export function downloadBytes(bytes, filename) {
