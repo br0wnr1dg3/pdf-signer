@@ -1044,6 +1044,13 @@ export function removeOverlay(id) {
 
 export function removeSelected() { if (selectedId) removeOverlay(selectedId); }
 
+/** Drop every overlay: their page elements belong to a document that is being replaced. */
+export function clearOverlays() {
+  for (const o of overlays) o.el.remove();
+  overlays.length = 0;
+  deselect();
+}
+
 /**
  * type: 'signature' | 'date' | 'text'
  * pageInfo: { index, el, viewport } from pdfView
@@ -1131,6 +1138,7 @@ function attach(o, handle) {
       o.el.contentEditable = 'false';
       o.value = o.el.textContent.trim() || o.value;
       o.el.textContent = o.value;
+      o.el.appendChild(handle); // the handle is inside the editable box: editing drops it
     });
     o.el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); o.el.blur(); } e.stopPropagation(); });
   }
@@ -1152,7 +1160,15 @@ Note: text overlays have no padding/border (CSS), so the model's w/h is exactly 
 
 - [ ] **Step 2: Wire buttons in app.js**
 
-Add imports: `import { addOverlay, initOverlayGlobals, getOverlays } from './overlays.js';` and `import { getSavedSignature } from './signaturePad.js';` (merge with the existing signaturePad import). Add:
+Add imports: `import { addOverlay, initOverlayGlobals, getOverlays, clearOverlays } from './overlays.js';` and `import { getSavedSignature } from './signaturePad.js';` (merge with the existing signaturePad import). In `openFile`, the overlays on screen belong to the outgoing document's page elements, so drop them in the first-`onPage` reveal block — a PDF that fails to parse never gets there and leaves the open document, overlays and all, untouched:
+
+```js
+      if (!shown) {
+        shown = true;
+        clearOverlays(); // they belong to the previous document's pages, which are gone
+```
+
+Then add (`todayString` joins the existing `export { state };` list at the end of the file rather than being exported inline):
 
 ```js
 initOverlayGlobals();
@@ -1164,7 +1180,7 @@ const renderFmt = () => { fmtBtn.textContent = dateFormat === 'DMY' ? 'DD/MM/YYY
 renderFmt();
 fmtBtn.addEventListener('click', () => { dateFormat = dateFormat === 'DMY' ? 'MDY' : 'DMY'; localStorage.setItem(DATE_KEY, dateFormat); renderFmt(); });
 
-export function todayString() {
+function todayString() {
   const d = new Date();
   const dd = String(d.getDate()).padStart(2, '0'), mm = String(d.getMonth() + 1).padStart(2, '0'), yyyy = d.getFullYear();
   return dateFormat === 'DMY' ? `${dd}/${mm}/${yyyy}` : `${mm}/${dd}/${yyyy}`;
@@ -1194,11 +1210,13 @@ $('btn-add-signature').addEventListener('click', async () => {
 });
 $('btn-add-date').addEventListener('click', () => addOverlay('date', currentPage(), todayString()));
 $('btn-add-text').addEventListener('click', () => addOverlay('text', currentPage(), 'Text'));
+
+export { state, todayString };
 ```
 
 - [ ] **Step 3: Verify in browser**
 
-Open a multi-page PDF, scroll to page 2, click + Signature: it appears centred on page 2, selected. Drag it; it can't leave the page. Resize keeps aspect. + Date shows today's date; toggling format then adding another date changes format. + Text → double-click → type → Enter commits. Delete key removes the selected overlay; Backspace while editing text does NOT delete the overlay. Clicking on the page background deselects.
+Open a multi-page PDF, scroll to page 2, click + Signature: it appears centred on page 2, selected. Drag it; it can't leave the page. Resize keeps aspect. + Date shows today's date; toggling format then adding another date changes format. + Text → double-click → type → Enter commits. Delete key removes the selected overlay; Backspace while editing text does NOT delete the overlay. Clicking on the page background deselects. Opening a second PDF clears every overlay; a file that fails to parse leaves them alone.
 
 - [ ] **Step 4: Commit**
 

@@ -1,6 +1,7 @@
 import { showToast } from './toast.js';
 import { loadPdf, closePdf } from './pdfView.js';
-import { openSignaturePad } from './signaturePad.js';
+import { openSignaturePad, getSavedSignature } from './signaturePad.js';
+import { addOverlay, initOverlayGlobals, getOverlays, clearOverlays } from './overlays.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { file: null, bytes: null, pages: [] };
@@ -36,6 +37,7 @@ async function openFile(file) {
     const { bytes, pages } = await loadPdf(file, $('pages'), (page, numPages) => {
       if (!shown) {
         shown = true;
+        clearOverlays(); // they belong to the previous document's pages, which are gone
         $('drop-zone').hidden = true;
         $('pages').hidden = false;
       }
@@ -91,4 +93,44 @@ $('btn-sign').addEventListener('click', async () => {
   if (sig) showToast('Signature saved.');
 });
 
-export { state };
+initOverlayGlobals();
+
+const DATE_KEY = 'pdf-signer:dateFormat';
+let dateFormat = localStorage.getItem(DATE_KEY) || 'DMY';
+const fmtBtn = $('btn-date-format');
+const renderFmt = () => { fmtBtn.textContent = dateFormat === 'DMY' ? 'DD/MM/YYYY' : 'MM/DD/YYYY'; };
+renderFmt();
+fmtBtn.addEventListener('click', () => { dateFormat = dateFormat === 'DMY' ? 'MDY' : 'DMY'; localStorage.setItem(DATE_KEY, dateFormat); renderFmt(); });
+
+function todayString() {
+  const d = new Date();
+  const dd = String(d.getDate()).padStart(2, '0'), mm = String(d.getMonth() + 1).padStart(2, '0'), yyyy = d.getFullYear();
+  return dateFormat === 'DMY' ? `${dd}/${mm}/${yyyy}` : `${mm}/${dd}/${yyyy}`;
+}
+
+/** The page whose centre is nearest the viewport centre. */
+function currentPage() {
+  const mid = window.innerHeight / 2;
+  let best = state.pages[0], bestDist = Infinity;
+  for (const p of state.pages) {
+    const r = p.el.getBoundingClientRect();
+    const d = Math.abs((r.top + r.bottom) / 2 - mid);
+    if (d < bestDist) { best = p; bestDist = d; }
+  }
+  return best;
+}
+
+function imageAspect(dataUrl) {
+  return new Promise((resolve) => { const i = new Image(); i.onload = () => resolve(i.width / i.height); i.onerror = () => resolve(3); i.src = dataUrl; });
+}
+
+$('btn-add-signature').addEventListener('click', async () => {
+  let sig = getSavedSignature();
+  if (!sig) sig = await openSignaturePad();
+  if (!sig) return;
+  addOverlay('signature', currentPage(), sig, await imageAspect(sig));
+});
+$('btn-add-date').addEventListener('click', () => addOverlay('date', currentPage(), todayString()));
+$('btn-add-text').addEventListener('click', () => addOverlay('text', currentPage(), 'Text'));
+
+export { state, todayString };
