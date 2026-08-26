@@ -8,10 +8,8 @@
 </head>
 <body>
   <header class="toolbar">
-    <label class="btn primary">
-      Open PDF
-      <input id="file-input" type="file" accept="application/pdf" hidden />
-    </label>
+    <button id="btn-open" class="btn primary">Open PDF</button>
+    <input id="file-input" type="file" accept="application/pdf" hidden />
     <span class="sep"></span>
     <button id="btn-sign" class="btn">Sign</button>
     <button id="btn-add-signature" class="btn" disabled>+ Signature</button>
@@ -31,14 +29,15 @@
     <div id="pages" class="pages" hidden></div>
   </main>
 
-  <div id="sig-modal" class="modal" hidden>
+  <div id="sig-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="sig-title" hidden>
     <div class="modal-card">
-      <h2>Draw your signature</h2>
+      <h2 id="sig-title">Draw your signature</h2>
       <canvas id="sig-canvas" width="600" height="220"></canvas>
       <div class="modal-row">
         <label>Pen <input id="sig-width" type="range" min="1" max="6" value="2.5" step="0.5" /></label>
         <button id="sig-clear" class="btn ghost">Clear</button>
-        <label class="btn ghost">Upload image<input id="sig-upload" type="file" accept="image/png,image/jpeg" hidden /></label>
+        <button id="sig-upload-btn" class="btn ghost">Upload image</button>
+        <input id="sig-upload" type="file" accept="image/png,image/jpeg" hidden />
         <span class="spacer"></span>
         <button id="sig-cancel" class="btn">Cancel</button>
         <button id="sig-save" class="btn primary">Save signature</button>
@@ -46,7 +45,7 @@
     </div>
   </div>
 
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" hidden></div>
 
   <script src="vendor/pdf-lib.min.js"></script>
   <script type="module" src="src/app.js"></script>

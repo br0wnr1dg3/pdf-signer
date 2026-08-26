@@ -74,7 +74,7 @@ pdf-signer/
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "start": "python3 -m http.server 8765",
+    "start": "python3 -m http.server 8765 --bind 127.0.0.1",
     "samples": "node samples/make-samples.mjs"
   }
 }
@@ -103,18 +103,22 @@ cd /tmp/pdfsigner-vendor && rm -rf package && tar xzf pdf-lib-*.tgz && cp packag
 rm -rf /tmp/pdfsigner-vendor
 ls -la vendor
 ```
-Expected: three files, `pdf.min.mjs` and `pdf.worker.min.mjs` each several hundred KB, `pdf-lib.min.js` ~500 KB. Add `vendor/README.md` with one line: `pdfjs-dist 6.x (Apache-2.0), pdf-lib 1.17.1 (MIT). Vendored; see package.json versions in git history.`
+Expected: three files, `pdf.min.mjs` and `pdf.worker.min.mjs` each several hundred KB, `pdf-lib.min.js` ~500 KB. Add `vendor/README.md` with one line: `pdfjs-dist 6.2.108 (Apache-2.0): pdf.min.mjs, pdf.worker.min.mjs. pdf-lib 1.17.1 (MIT): pdf-lib.min.js. Vendored unmodified from npm.`
 
 - [ ] **Step 3: open.command launcher**
 
 ```bash
 #!/bin/bash
-# Double-click me. Starts a local server and opens the app.
-cd "$(dirname "$0")"
+# Double-click me. Starts a local server (localhost only) and opens the app.
+cd "$(dirname "$0")" || exit 1
 PORT=8765
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required. Install Xcode Command Line Tools: xcode-select --install"; read -r; exit 1
+fi
 if ! lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
-  python3 -m http.server $PORT >/dev/null 2>&1 &
-  sleep 0.5
+  nohup python3 -m http.server $PORT --bind 127.0.0.1 >/dev/null 2>&1 &
+  disown
+  for _ in $(seq 1 20); do lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.1; done
 fi
 open "http://localhost:$PORT/"
 ```
@@ -133,10 +137,8 @@ Run: `chmod +x open.command`
 </head>
 <body>
   <header class="toolbar">
-    <label class="btn primary">
-      Open PDF
-      <input id="file-input" type="file" accept="application/pdf" hidden />
-    </label>
+    <button id="btn-open" class="btn primary">Open PDF</button>
+    <input id="file-input" type="file" accept="application/pdf" hidden />
     <span class="sep"></span>
     <button id="btn-sign" class="btn">Sign</button>
     <button id="btn-add-signature" class="btn" disabled>+ Signature</button>
@@ -156,14 +158,15 @@ Run: `chmod +x open.command`
     <div id="pages" class="pages" hidden></div>
   </main>
 
-  <div id="sig-modal" class="modal" hidden>
+  <div id="sig-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="sig-title" hidden>
     <div class="modal-card">
-      <h2>Draw your signature</h2>
+      <h2 id="sig-title">Draw your signature</h2>
       <canvas id="sig-canvas" width="600" height="220"></canvas>
       <div class="modal-row">
         <label>Pen <input id="sig-width" type="range" min="1" max="6" value="2.5" step="0.5" /></label>
         <button id="sig-clear" class="btn ghost">Clear</button>
-        <label class="btn ghost">Upload image<input id="sig-upload" type="file" accept="image/png,image/jpeg" hidden /></label>
+        <button id="sig-upload-btn" class="btn ghost">Upload image</button>
+        <input id="sig-upload" type="file" accept="image/png,image/jpeg" hidden />
         <span class="spacer"></span>
         <button id="sig-cancel" class="btn">Cancel</button>
         <button id="sig-save" class="btn primary">Save signature</button>
@@ -171,7 +174,7 @@ Run: `chmod +x open.command`
     </div>
   </div>
 
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" hidden></div>
 
   <script src="vendor/pdf-lib.min.js"></script>
   <script type="module" src="src/app.js"></script>
@@ -184,12 +187,13 @@ Run: `chmod +x open.command`
 ```css
 :root { --bg:#e9ebee; --bar:#fff; --accent:#2f6fed; --text:#1c1e21; --muted:#6b7280; --border:#d1d5db; }
 * { box-sizing: border-box; }
-html, body { margin:0; height:100%; font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; color:var(--text); background:var(--bg); }
-.toolbar { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:8px; padding:10px 14px; background:var(--bar); border-bottom:1px solid var(--border); }
+[hidden] { display: none !important; }
+html, body { margin:0; min-height:100%; font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; color:var(--text); background:var(--bg); }
+.toolbar { position:sticky; top:0; z-index:20; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px 14px; background:var(--bar); border-bottom:1px solid var(--border); }
 .toolbar .sep { width:1px; height:22px; background:var(--border); margin:0 4px; }
 .toolbar .spacer, .modal-row .spacer { flex:1; }
 .file-name { color:var(--muted); margin-right:8px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.btn { display:inline-flex; align-items:center; gap:6px; padding:7px 12px; border:1px solid var(--border); border-radius:8px; background:#fff; cursor:pointer; font:inherit; }
+.btn { display:inline-flex; align-items:center; gap:6px; padding:7px 12px; border:1px solid var(--border); border-radius:8px; background:#fff; cursor:pointer; font:inherit; flex-shrink:0; }
 .btn:hover:not(:disabled) { background:#f3f4f6; }
 .btn:disabled { opacity:.45; cursor:default; }
 .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
@@ -199,23 +203,22 @@ html, body { margin:0; height:100%; font: 14px/1.4 -apple-system, BlinkMacSystem
 .drop-zone { width:min(800px, 100%); height:60vh; display:flex; flex-direction:column; justify-content:center; align-items:center; border:2px dashed var(--border); border-radius:16px; color:var(--text); font-size:20px; background:#fff; }
 .drop-zone.over { border-color:var(--accent); background:#eef3ff; }
 .muted { color:var(--muted); font-size:14px; }
-.pages { display:flex; flex-direction:column; gap:20px; }
-.page { position:relative; background:#fff; box-shadow:0 2px 10px rgba(0,0,0,.15); }
+.pages { display:flex; flex-direction:column; align-items:center; gap:20px; }
+.page { position:relative; background:#fff; box-shadow:0 2px 10px rgba(0,0,0,.15); flex-shrink:0; }
 .page canvas { display:block; }
-.overlay { position:absolute; cursor:move; user-select:none; border:1px solid transparent; }
-.overlay.selected { border-color:var(--accent); }
+.overlay { position:absolute; cursor:move; user-select:none; }
 .overlay img { width:100%; height:100%; display:block; pointer-events:none; }
-.overlay.text, .overlay.date { padding:2px 4px; font-family:Helvetica, Arial, sans-serif; white-space:nowrap; overflow:hidden; outline:none; line-height:1; }
+.overlay.text, .overlay.date { font-family:Helvetica, Arial, sans-serif; white-space:nowrap; overflow:hidden; outline:none; line-height:1; }
+.overlay[contenteditable="true"] { user-select:text; cursor:text; }
+.overlay.selected { outline:1px solid var(--accent); outline-offset:0; }
 .overlay .handle { position:absolute; right:-6px; bottom:-6px; width:12px; height:12px; background:var(--accent); border-radius:50%; cursor:nwse-resize; display:none; }
 .overlay.selected .handle { display:block; }
 .modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; z-index:50; }
-.modal[hidden] { display:none; }
 .modal-card { background:#fff; padding:20px; border-radius:14px; width:640px; max-width:95vw; }
 .modal-card h2 { margin:0 0 12px; font-size:18px; }
 #sig-canvas { width:100%; border:1px solid var(--border); border-radius:8px; background:#fff; touch-action:none; cursor:crosshair; }
 .modal-row { display:flex; align-items:center; gap:10px; margin-top:12px; }
 .toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#111827; color:#fff; padding:10px 16px; border-radius:10px; z-index:60; box-shadow:0 4px 14px rgba(0,0,0,.3); }
-.toast[hidden] { display:none; }
 ```
 
 - [ ] **Step 6: src/toast.js**
@@ -235,6 +238,9 @@ export function showToast(message, ms = 3500) {
 
 ```js
 import { showToast } from './toast.js';
+
+document.getElementById('btn-open').addEventListener('click', () => document.getElementById('file-input').click());
+
 console.log('PDF Signer loaded');
 ```
 
@@ -492,6 +498,7 @@ async function openFile(file) {
   }
 }
 
+$('btn-open').addEventListener('click', () => $('file-input').click());
 $('file-input').addEventListener('change', (e) => openFile(e.target.files[0]));
 
 const dz = $('drop-zone');
@@ -581,27 +588,34 @@ export function openSignaturePad() {
   };
 
   return new Promise((resolve) => {
+    const cancel = () => { cleanup(); resolve(null); };
+    const onKeydown = (e) => { if (e.key === 'Escape') cancel(); };
     const cleanup = () => {
       canvas.removeEventListener('pointerdown', down); canvas.removeEventListener('pointermove', move);
       canvas.removeEventListener('pointerup', up); canvas.removeEventListener('pointercancel', up);
       document.getElementById('sig-clear').onclick = null;
       document.getElementById('sig-upload').onchange = null;
+      document.getElementById('sig-upload-btn').onclick = null;
       document.getElementById('sig-cancel').onclick = null;
       document.getElementById('sig-save').onclick = null;
+      document.removeEventListener('keydown', onKeydown);
       modal.hidden = true;
     };
     canvas.addEventListener('pointerdown', down); canvas.addEventListener('pointermove', move);
     canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
     document.getElementById('sig-clear').onclick = clear;
     document.getElementById('sig-upload').onchange = onUpload;
-    document.getElementById('sig-cancel').onclick = () => { cleanup(); resolve(null); };
+    document.getElementById('sig-upload-btn').onclick = () => document.getElementById('sig-upload').click();
+    document.getElementById('sig-cancel').onclick = cancel;
     document.getElementById('sig-save').onclick = () => {
       if (!hasInk) return;
       const dataUrl = uploaded ?? trimmedPng(canvas);
       localStorage.setItem(KEY, dataUrl);
       cleanup(); resolve(dataUrl);
     };
+    document.addEventListener('keydown', onKeydown);
     modal.hidden = false;
+    document.getElementById('sig-save').focus();
   });
 }
 
@@ -774,6 +788,8 @@ export function initOverlayGlobals() {
   });
 }
 ```
+
+Note: text overlays have no padding/border (CSS), so the model's w/h is exactly the glyph box that `exporter.js` maps to PDF.
 
 - [ ] **Step 2: Wire buttons in app.js**
 
