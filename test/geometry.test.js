@@ -90,6 +90,13 @@ test('a rect covering the whole rendered image is the whole page, at every rotat
   }
 });
 
+test('with a CropBox origin, the whole rendered image is the whole page at that origin, at every rotation', () => {
+  for (const vp of [vp0, vp90, vp180, vp270, vp180s2, vp270s2]) {
+    const got = toPdfRect({ x: 0, y: 0, w: vp.width, h: vp.height }, { ...vp, offsetX: 5, offsetY: 7 });
+    eqRect(got, { x: 5, y: 7, w: vp.pdfWidth, h: vp.pdfHeight });
+  }
+});
+
 // --- validation and normalization ---
 
 test('toPdfRect rejects unknown rotation', () => {

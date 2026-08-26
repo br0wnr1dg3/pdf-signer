@@ -380,6 +380,13 @@ test('a rect covering the whole rendered image is the whole page, at every rotat
   }
 });
 
+test('with a CropBox origin, the whole rendered image is the whole page at that origin, at every rotation', () => {
+  for (const vp of [vp0, vp90, vp180, vp270, vp180s2, vp270s2]) {
+    const got = toPdfRect({ x: 0, y: 0, w: vp.width, h: vp.height }, { ...vp, offsetX: 5, offsetY: 7 });
+    eqRect(got, { x: 5, y: 7, w: vp.pdfWidth, h: vp.pdfHeight });
+  }
+});
+
 // --- validation and normalization ---
 
 test('toPdfRect rejects unknown rotation', () => {
@@ -608,7 +615,7 @@ let loadSeq = 0;        // generation counter: only the newest loadPdf call may 
 export async function closePdf() {
   const task = currentTask;
   currentTask = null;
-  if (task) await task.destroy();
+  if (task) await task.destroy().catch(() => {});
 }
 
 /**
@@ -622,7 +629,11 @@ export async function closePdf() {
  *
  * Only the most recent call may write to `container`: a superseded call cancels its render and
  * throws Error('superseded'), which the caller should ignore.
- * Throws Error('encrypted') for password-protected files, Error('invalid') otherwise.
+ *
+ * Errors: Error('encrypted') for a password-protected file and Error('invalid') for one that
+ * will not parse — both thrown before anything is touched, so whatever was open stays open.
+ * Error('render-failed') means the container was already cleared and there is nothing left on
+ * screen. Error('superseded') means a newer call has taken over.
  */
 export async function loadPdf(file, container, onPage) {
   const seq = ++loadSeq;
@@ -632,8 +643,8 @@ export async function loadPdf(file, container, onPage) {
     throw new Error('superseded');
   };
 
-  await closePdf();
-
+  // Parse before touching anything: a file that turns out not to be a PDF must leave the
+  // document already on screen exactly as it was.
   const bytes = new Uint8Array(await file.arrayBuffer());
   const loadingTask = pdfjsLib.getDocument({ data: bytes.slice() });
   let doc;
@@ -644,8 +655,13 @@ export async function loadPdf(file, container, onPage) {
     if (err?.name === 'PasswordException') throw new Error('encrypted');
     throw new Error('invalid');
   }
-  if (seq !== loadSeq) { await loadingTask.destroy(); throw new Error('superseded'); }
+  if (seq !== loadSeq) { await loadingTask.destroy().catch(() => {}); throw new Error('superseded'); }
+
+  // Take ownership synchronously, so a concurrent load can never destroy the task we are about
+  // to render: no await between the generation check above and this assignment.
+  const previous = currentTask;
   currentTask = loadingTask;
+  if (previous) await previous.destroy().catch(() => {});
 
   container.innerHTML = '';
   const pages = [];
@@ -693,10 +709,11 @@ export async function loadPdf(file, container, onPage) {
     }
   } catch (err) {
     if (seq !== loadSeq || err?.message === 'superseded') throw new Error('superseded');
+    // The container was already cleared, so there is nothing to keep: fall back to empty.
     container.innerHTML = '';
     currentTask = null;
     await loadingTask.destroy().catch(() => {});
-    throw new Error('invalid');
+    throw new Error('render-failed');
   }
   return { bytes, pages };
 }
@@ -735,18 +752,23 @@ function showEmptyState() {
 
 async function openFile(file) {
   if (!file) return;
+  // Second opens are rejected while loading, so loadPdf's supersede path is defence-in-depth only.
   if (loading) { showToast('Still loading the previous PDF…'); return; }
   if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
     showToast('That is not a PDF.'); return;
   }
   loading = true;
-  // Show the page area straight away so pages appear as they render.
-  $('drop-zone').hidden = true;
-  $('pages').hidden = false;
-  $('file-name').textContent = `${file.name} — loading…`;
-  setEditingEnabled(false);
+  // Nothing on screen changes until the first page renders, so a file that fails to parse
+  // leaves the document already open untouched.
+  let shown = false;
   try {
     const { bytes, pages } = await loadPdf(file, $('pages'), (page, numPages) => {
+      if (!shown) {
+        shown = true;
+        $('drop-zone').hidden = true;
+        $('pages').hidden = false;
+        setEditingEnabled(false);
+      }
       $('file-name').textContent = `${file.name} — loading page ${page.index + 1}/${numPages}…`;
     });
     Object.assign(state, { file, bytes, pages });
@@ -754,8 +776,13 @@ async function openFile(file) {
     setEditingEnabled(true);
   } catch (err) {
     if (err?.message === 'superseded') return; // a newer load owns the container now
-    await closePdf();
-    showEmptyState();
+    if (err?.message === 'render-failed') {
+      await closePdf(); // loadPdf already tore the document down; make sure of it
+      showEmptyState();
+      showToast("Couldn't render this PDF.");
+      return;
+    }
+    // 'encrypted' / 'invalid': nothing was touched, so just say so.
     showToast(err.message === 'encrypted'
       ? "Couldn't open this PDF (it's password-protected)."
       : "Couldn't open this PDF (encrypted or corrupted).");
@@ -779,6 +806,7 @@ const paintDrag = () => dz.classList.toggle('over', dragDepth > 0);
 document.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; paintDrag(); });
 document.addEventListener('dragleave', (e) => { e.preventDefault(); dragDepth = Math.max(0, dragDepth - 1); paintDrag(); });
 document.addEventListener('dragover', (e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; });
+document.addEventListener('dragend', () => { dragDepth = 0; paintDrag(); }); // drag abandoned, no drop
 document.addEventListener('drop', (e) => {
   e.preventDefault();
   dragDepth = 0; paintDrag();
@@ -792,7 +820,7 @@ export { state };
 
 - [ ] **Step 3: Verify in browser**
 
-Start server, open the page, drop any PDF: pages render at 800px wide, stacked, appearing one at a time while the toolbar shows `name — loading page n/N…`. Open a second PDF: its pages replace the first and the previous document's worker is destroyed. Re-pick the same file from the picker: it reloads (the input value is cleared). Drag over the page: the highlight must not flicker as the pointer crosses child elements. Drop a `.txt` renamed `.pdf`: toast "Couldn't open this PDF (encrypted or corrupted)." and the drop zone comes back. Console must be clean of errors (a worker-load error means the `workerSrc` URL is wrong).
+Start server, open the page, drop any PDF: pages render at 800px wide, stacked, appearing one at a time while the toolbar shows `name — loading page n/N…`. Open a second PDF: its pages replace the first and the previous document's worker is destroyed. Re-pick the same file from the picker: it reloads (the input value is cleared). Drag over the page: the highlight must not flicker as the pointer crosses child elements. Drop a `.txt` renamed `.pdf` with nothing open: toast "Couldn't open this PDF (encrypted or corrupted)." and the drop zone stays. Drop the same file **with a PDF already open**: the toast appears and that document stays on screen untouched — parsing happens before anything is cleared. Console must be clean of errors (a worker-load error means the `workerSrc` URL is wrong).
 
 - [ ] **Step 4: Commit**
 
@@ -1138,6 +1166,8 @@ git add src/overlays.js src/app.js && git commit -m "feat: draggable, resizable,
 
 - [ ] **Step 1: Implement exporter.js**
 
+Use `viewport.pdfWidth`/`pdfHeight`/`offsetX`/`offsetY` as the source of truth — never pdf-lib's `page.getSize()`, which is the MediaBox. pdf.js renders the CropBox, so on a cropped page the two differ and every overlay would land offset.
+
 ```js
 import { toPdfRect, textLayout, imageLayout } from './geometry.js';
 
@@ -1285,7 +1315,8 @@ Run `npm run samples` first.
 | 10 | Repeat 3–9 with `samples/landscape.pdf` | Same |
 | 11 | Repeat 3–9 with `samples/rotated90.pdf` | Items upright and correctly placed |
 | 12 | Open a password-protected PDF | Toast: password-protected message |
-| 13 | Open a 60+ page PDF | Renders progressively; UI stays responsive |
+| 13 | Open a 100-page PDF | Renders progressively; scrolling stays usable |
+| 14 | With a PDF open, drop a corrupt `.pdf` | Toast; the open document and its overlays remain |
 ```
 
 - [ ] **Step 4: Run unit tests one last time, commit**

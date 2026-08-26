@@ -40,7 +40,8 @@ No backend, no build step, no network. Opened via `python3 -m http.server` (need
 
 ## Error handling
 
-- Password-protected PDF → toast: "Couldn't open this PDF (it's password-protected)." Unparsable PDF → "Couldn't open this PDF (encrypted or corrupted)." Non-PDF file → "That is not a PDF."
+- Password-protected PDF → toast: "Couldn't open this PDF (it's password-protected)." Unparsable PDF → "Couldn't open this PDF (encrypted or corrupted)." Non-PDF file → "That is not a PDF." All three are decided before anything is cleared, so a document already open stays open.
+- A PDF that parses but fails to render → "Couldn't render this PDF." and the view falls back to the empty state (there is nothing left to show).
 - Opening a PDF while one is still rendering → "Still loading the previous PDF…" (the in-flight load is left alone). Dropping several files at once → "One PDF at a time." and the first is used.
 - No saved signature when clicking "+ Signature" → opens the signature pad first.
 - Export failure → toast with the error message; no download.

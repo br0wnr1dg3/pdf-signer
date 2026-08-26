@@ -14,7 +14,7 @@ let loadSeq = 0;        // generation counter: only the newest loadPdf call may 
 export async function closePdf() {
   const task = currentTask;
   currentTask = null;
-  if (task) await task.destroy();
+  if (task) await task.destroy().catch(() => {});
 }
 
 /**
@@ -28,7 +28,11 @@ export async function closePdf() {
  *
  * Only the most recent call may write to `container`: a superseded call cancels its render and
  * throws Error('superseded'), which the caller should ignore.
- * Throws Error('encrypted') for password-protected files, Error('invalid') otherwise.
+ *
+ * Errors: Error('encrypted') for a password-protected file and Error('invalid') for one that
+ * will not parse — both thrown before anything is touched, so whatever was open stays open.
+ * Error('render-failed') means the container was already cleared and there is nothing left on
+ * screen. Error('superseded') means a newer call has taken over.
  */
 export async function loadPdf(file, container, onPage) {
   const seq = ++loadSeq;
@@ -38,8 +42,8 @@ export async function loadPdf(file, container, onPage) {
     throw new Error('superseded');
   };
 
-  await closePdf();
-
+  // Parse before touching anything: a file that turns out not to be a PDF must leave the
+  // document already on screen exactly as it was.
   const bytes = new Uint8Array(await file.arrayBuffer());
   const loadingTask = pdfjsLib.getDocument({ data: bytes.slice() });
   let doc;
@@ -50,8 +54,13 @@ export async function loadPdf(file, container, onPage) {
     if (err?.name === 'PasswordException') throw new Error('encrypted');
     throw new Error('invalid');
   }
-  if (seq !== loadSeq) { await loadingTask.destroy(); throw new Error('superseded'); }
+  if (seq !== loadSeq) { await loadingTask.destroy().catch(() => {}); throw new Error('superseded'); }
+
+  // Take ownership synchronously, so a concurrent load can never destroy the task we are about
+  // to render: no await between the generation check above and this assignment.
+  const previous = currentTask;
   currentTask = loadingTask;
+  if (previous) await previous.destroy().catch(() => {});
 
   container.innerHTML = '';
   const pages = [];
@@ -99,10 +108,11 @@ export async function loadPdf(file, container, onPage) {
     }
   } catch (err) {
     if (seq !== loadSeq || err?.message === 'superseded') throw new Error('superseded');
+    // The container was already cleared, so there is nothing to keep: fall back to empty.
     container.innerHTML = '';
     currentTask = null;
     await loadingTask.destroy().catch(() => {});
-    throw new Error('invalid');
+    throw new Error('render-failed');
   }
   return { bytes, pages };
 }

@@ -21,18 +21,23 @@ function showEmptyState() {
 
 async function openFile(file) {
   if (!file) return;
+  // Second opens are rejected while loading, so loadPdf's supersede path is defence-in-depth only.
   if (loading) { showToast('Still loading the previous PDF…'); return; }
   if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
     showToast('That is not a PDF.'); return;
   }
   loading = true;
-  // Show the page area straight away so pages appear as they render.
-  $('drop-zone').hidden = true;
-  $('pages').hidden = false;
-  $('file-name').textContent = `${file.name} — loading…`;
-  setEditingEnabled(false);
+  // Nothing on screen changes until the first page renders, so a file that fails to parse
+  // leaves the document already open untouched.
+  let shown = false;
   try {
     const { bytes, pages } = await loadPdf(file, $('pages'), (page, numPages) => {
+      if (!shown) {
+        shown = true;
+        $('drop-zone').hidden = true;
+        $('pages').hidden = false;
+        setEditingEnabled(false);
+      }
       $('file-name').textContent = `${file.name} — loading page ${page.index + 1}/${numPages}…`;
     });
     Object.assign(state, { file, bytes, pages });
@@ -40,8 +45,13 @@ async function openFile(file) {
     setEditingEnabled(true);
   } catch (err) {
     if (err?.message === 'superseded') return; // a newer load owns the container now
-    await closePdf();
-    showEmptyState();
+    if (err?.message === 'render-failed') {
+      await closePdf(); // loadPdf already tore the document down; make sure of it
+      showEmptyState();
+      showToast("Couldn't render this PDF.");
+      return;
+    }
+    // 'encrypted' / 'invalid': nothing was touched, so just say so.
     showToast(err.message === 'encrypted'
       ? "Couldn't open this PDF (it's password-protected)."
       : "Couldn't open this PDF (encrypted or corrupted).");
@@ -65,6 +75,7 @@ const paintDrag = () => dz.classList.toggle('over', dragDepth > 0);
 document.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; paintDrag(); });
 document.addEventListener('dragleave', (e) => { e.preventDefault(); dragDepth = Math.max(0, dragDepth - 1); paintDrag(); });
 document.addEventListener('dragover', (e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; });
+document.addEventListener('dragend', () => { dragDepth = 0; paintDrag(); }); // drag abandoned, no drop
 document.addEventListener('drop', (e) => {
   e.preventDefault();
   dragDepth = 0; paintDrag();
