@@ -18,6 +18,7 @@ function showEmptyState() {
   $('drop-zone').hidden = false;
   $('file-name').textContent = '';
   Object.assign(state, { file: null, bytes: null, pages: [] });
+  clearOverlays(); // the pages they sat on are gone
   setEditingEnabled(false);
 }
 
@@ -108,8 +109,9 @@ function todayString() {
   return dateFormat === 'DMY' ? `${dd}/${mm}/${yyyy}` : `${mm}/${dd}/${yyyy}`;
 }
 
-/** The page whose centre is nearest the viewport centre. */
+/** The page whose centre is nearest the viewport centre, or null with no document open. */
 function currentPage() {
+  if (state.pages.length === 0) return null;
   const mid = window.innerHeight / 2;
   let best = state.pages[0], bestDist = Infinity;
   for (const p of state.pages) {
@@ -120,17 +122,22 @@ function currentPage() {
   return best;
 }
 
+/** Resolves null if the data URL will not decode, so we never place an invisible overlay. */
 function imageAspect(dataUrl) {
-  return new Promise((resolve) => { const i = new Image(); i.onload = () => resolve(i.width / i.height); i.onerror = () => resolve(3); i.src = dataUrl; });
+  return new Promise((resolve) => { const i = new Image(); i.onload = () => resolve(i.width / i.height); i.onerror = () => resolve(null); i.src = dataUrl; });
 }
 
 $('btn-add-signature').addEventListener('click', async () => {
+  const page = currentPage();
+  if (!page) return;
   let sig = getSavedSignature();
   if (!sig) sig = await openSignaturePad();
   if (!sig) return;
-  addOverlay('signature', currentPage(), sig, await imageAspect(sig));
+  const aspect = await imageAspect(sig);
+  if (aspect == null) { showToast('Saved signature image is unreadable — draw a new one.'); return; }
+  addOverlay('signature', page, sig, aspect);
 });
-$('btn-add-date').addEventListener('click', () => addOverlay('date', currentPage(), todayString()));
-$('btn-add-text').addEventListener('click', () => addOverlay('text', currentPage(), 'Text'));
+$('btn-add-date').addEventListener('click', () => { const page = currentPage(); if (page) addOverlay('date', page, todayString()); });
+$('btn-add-text').addEventListener('click', () => { const page = currentPage(); if (page) addOverlay('text', page, 'Text'); });
 
 export { state, todayString };

@@ -207,7 +207,7 @@ html, body { margin:0; min-height:100%; font: 14px/1.4 -apple-system, BlinkMacSy
 .pages { display:flex; flex-direction:column; align-items:center; gap:20px; }
 .page { position:relative; background:#fff; box-shadow:0 2px 10px rgba(0,0,0,.15); flex-shrink:0; }
 .page canvas { display:block; }
-.overlay { position:absolute; cursor:move; user-select:none; }
+.overlay { position:absolute; cursor:move; user-select:none; touch-action:none; }
 .overlay img { width:100%; height:100%; display:block; pointer-events:none; }
 .overlay.text, .overlay.date { font-family:Helvetica, Arial, sans-serif; white-space:nowrap; overflow:hidden; outline:none; line-height:1; }
 .overlay[contenteditable="true"] { user-select:text; cursor:text; }
@@ -1028,9 +1028,12 @@ git add src/signaturePad.js src/app.js && git commit -m "feat: signature pad wit
 - [ ] **Step 1: Implement overlays.js**
 
 ```js
+import { FONT_SIZE_RATIO } from './geometry.js';
+
 const overlays = [];   // model, see plan header
 let selectedId = null;
 let nextId = 1;
+let globalsInit = false;
 
 export function getOverlays() { return overlays.map(o => ({ ...o })); }
 
@@ -1043,6 +1046,11 @@ export function removeOverlay(id) {
 }
 
 export function removeSelected() { if (selectedId) removeOverlay(selectedId); }
+
+/** Blur any edit still in progress so its text is committed to the model. Call before reading. */
+export function commitEdits() {
+  for (const o of overlays) if (o.el.contentEditable === 'true') o.el.blur();
+}
 
 /** Drop every overlay: their page elements belong to a document that is being replaced. */
 export function clearOverlays() {
@@ -1062,7 +1070,9 @@ export function addOverlay(type, pageInfo, value, imgAspect = 3) {
   let w, h;
   if (type === 'signature') { w = Math.min(180, pw * 0.4); h = w / imgAspect; }
   else { h = 22; w = type === 'date' ? 110 : 160; }
-  const o = { id: `o${nextId++}`, page: pageInfo.index, type, x: (pw - w) / 2, y: (ph - h) / 2, w, h, value, aspect: imgAspect };
+  // pageW/pageH come from the viewport, not the live element, so clamping survives a re-layout.
+  const o = { id: `o${nextId++}`, page: pageInfo.index, type, x: (pw - w) / 2, y: (ph - h) / 2, w, h, value,
+              aspect: imgAspect, pageW: pw, pageH: ph };
 
   const el = document.createElement('div');
   el.className = `overlay ${type}`;
@@ -1079,6 +1089,7 @@ export function addOverlay(type, pageInfo, value, imgAspect = 3) {
   o.el = el;
   overlays.push(o);
   layout(o);
+  if (type !== 'signature') { fitText(o); o.x = Math.max(0, (pw - o.w) / 2); layout(o); }
   attach(o, handle);
   select(o.id);
   return o.id;
@@ -1086,7 +1097,26 @@ export function addOverlay(type, pageInfo, value, imgAspect = 3) {
 
 function layout(o) {
   Object.assign(o.el.style, { left: `${o.x}px`, top: `${o.y}px`, width: `${o.w}px`, height: `${o.h}px` });
-  if (o.type !== 'signature') o.el.style.fontSize = `${o.h * 0.8}px`;
+  if (o.type !== 'signature') o.el.style.fontSize = `${o.h * FONT_SIZE_RATIO}px`;
+}
+
+function clamp(o) {
+  o.x = Math.max(0, Math.min(o.x, o.pageW - o.w));
+  o.y = Math.max(0, Math.min(o.y, o.pageH - o.h));
+}
+
+/**
+ * A text box is as wide as its glyphs: the handle sets the height (font size) and the width
+ * follows. Measured at `max-content` because scrollWidth never reports less than the width
+ * already set, so the box could grow but never shrink back; the out-of-flow handle does not
+ * count towards it. Rounded up so overflow:hidden can never clip the last glyph.
+ */
+function fitText(o) {
+  layout(o); // font size first, so the measurement uses the new one
+  o.el.style.width = 'max-content';
+  o.w = Math.max(12, Math.ceil(o.el.getBoundingClientRect().width)); // 12: room for the caret when empty
+  clamp(o);
+  layout(o);
 }
 
 function select(id) {
@@ -1095,37 +1125,62 @@ function select(id) {
 }
 export function deselect() { select(null); }
 
-function attach(o, handle) {
-  const clamp = () => {
-    const pw = o.el.parentElement.clientWidth, ph = o.el.parentElement.clientHeight;
-    o.x = Math.max(0, Math.min(o.x, pw - o.w));
-    o.y = Math.max(0, Math.min(o.y, ph - o.h));
+/** Follow one pointer gesture on the element that received it, capture and cancellation included. */
+function trackPointer(el, e, move) {
+  try { el.setPointerCapture(e.pointerId); } catch { /* pointer already gone: capture is optional */ }
+  const stop = () => {
+    el.removeEventListener('pointermove', move);
+    el.removeEventListener('pointerup', stop);
+    el.removeEventListener('pointercancel', stop);
+    el.removeEventListener('lostpointercapture', stop);
+    if (el.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId);
   };
+  el.addEventListener('pointermove', move);
+  el.addEventListener('pointerup', stop);
+  el.addEventListener('pointercancel', stop);
+  el.addEventListener('lostpointercapture', stop);
+}
 
+function attach(o, handle) {
   // Drag to move
   o.el.addEventListener('pointerdown', (e) => {
-    if (e.target === handle) return;
-    if (o.el.contentEditable === 'true') return; // editing text: let the caret work
+    if (e.button !== 0) return;                    // right/middle click must not start a drag
+    if (o.el.contentEditable === 'true') return;   // editing text: let the caret work
     e.preventDefault();
     select(o.id);
-    const sx = e.clientX - o.x, sy = e.clientY - o.y;
-    const move = (ev) => { o.x = ev.clientX - sx; o.y = ev.clientY - sy; clamp(); layout(o); };
-    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
-    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+    const r0 = o.el.parentElement.getBoundingClientRect();
+    const grabDx = e.clientX - r0.left - o.x, grabDy = e.clientY - r0.top - o.y;
+    // Re-read the page rect every move: scrolling mid-drag must not teleport the overlay.
+    const move = (ev) => {
+      const r = o.el.parentElement.getBoundingClientRect();
+      o.x = ev.clientX - r.left - grabDx;
+      o.y = ev.clientY - r.top - grabDy;
+      clamp(o); layout(o);
+    };
+    trackPointer(o.el, e, move);
   });
 
   // Drag handle to resize
   handle.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
     e.preventDefault(); e.stopPropagation();
     select(o.id);
     const sx = e.clientX, sy = e.clientY, sw = o.w, sh = o.h;
     const move = (ev) => {
-      if (o.type === 'signature') { o.w = Math.max(30, sw + (ev.clientX - sx)); o.h = o.w / o.aspect; }
-      else { o.h = Math.max(10, sh + (ev.clientY - sy)); o.w = Math.max(30, sw + (ev.clientX - sx)); }
-      clamp(); layout(o);
+      if (o.type === 'signature') {
+        o.w = Math.max(30, sw + (ev.clientX - sx)); o.h = o.w / o.aspect;
+        if (o.w > o.pageW - o.x) { o.w = o.pageW - o.x; o.h = o.w / o.aspect; }
+        if (o.h > o.pageH - o.y) { o.h = o.pageH - o.y; o.w = o.h * o.aspect; }
+        clamp(o); layout(o);
+      } else {
+        o.h = Math.min(Math.max(10, sh + (ev.clientY - sy)), o.pageH - o.y);
+        fitText(o); // height is the only free axis; the width follows the glyphs
+        // Width is set by the font size, so the page is bounded by giving back height, never by
+        // clipping the box: a clipped preview would not match the text the exporter draws.
+        if (o.w > o.pageW) { o.h *= o.pageW / o.w; fitText(o); }
+      }
     };
-    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
-    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+    trackPointer(handle, e, move);
   });
 
   // Double-click to edit text
@@ -1134,11 +1189,23 @@ function attach(o, handle) {
       o.el.contentEditable = 'true'; o.el.focus();
       document.getSelection()?.selectAllChildren(o.el);
     });
+    o.el.addEventListener('input', () => fitText(o)); // grow as you type, so nothing is clipped
+    o.el.addEventListener('paste', (e) => {
+      e.preventDefault(); // rich clipboard content would drag markup into the box
+      const text = (e.clipboardData?.getData('text/plain') ?? '').replace(/\s+/g, ' ');
+      document.execCommand('insertText', false, text);
+    });
     o.el.addEventListener('blur', () => {
       o.el.contentEditable = 'false';
-      o.value = o.el.textContent.trim() || o.value;
+      const clean = o.el.textContent
+        .replace(/\s+/g, ' ')                    // one line: pasted breaks and tabs become spaces
+        .replace(/[^\x20-\x7E\xA0-\xFF]/g, '')   // only what Helvetica/WinAnsi can encode, or the export throws
+        .replace(/ {2,}/g, ' ')                  // close the gaps the strip left behind
+        .trim();
+      o.value = clean || o.value;
       o.el.textContent = o.value;
       o.el.appendChild(handle); // the handle is inside the editable box: editing drops it
+      fitText(o);
     });
     o.el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); o.el.blur(); } e.stopPropagation(); });
   }
@@ -1146,6 +1213,8 @@ function attach(o, handle) {
 
 /** Call once. Handles global deselect click and Delete/Backspace. */
 export function initOverlayGlobals() {
+  if (globalsInit) return;
+  globalsInit = true;
   document.addEventListener('pointerdown', (e) => { if (!e.target.closest('.overlay')) deselect(); });
   document.addEventListener('keydown', (e) => {
     if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId && document.activeElement?.contentEditable !== 'true'
@@ -1168,7 +1237,7 @@ Add imports: `import { addOverlay, initOverlayGlobals, getOverlays, clearOverlay
         clearOverlays(); // they belong to the previous document's pages, which are gone
 ```
 
-Then add (`todayString` joins the existing `export { state };` list at the end of the file rather than being exported inline):
+`showEmptyState` gains the same call — `clearOverlays(); // the pages they sat on are gone` — next to its `Object.assign(state, ...)`, so closing a document that failed to render leaves no orphans behind. Then add (`todayString` joins the existing `export { state };` list at the end of the file rather than being exported inline):
 
 ```js
 initOverlayGlobals();
@@ -1186,8 +1255,9 @@ function todayString() {
   return dateFormat === 'DMY' ? `${dd}/${mm}/${yyyy}` : `${mm}/${dd}/${yyyy}`;
 }
 
-/** The page whose centre is nearest the viewport centre. */
+/** The page whose centre is nearest the viewport centre, or null with no document open. */
 function currentPage() {
+  if (state.pages.length === 0) return null;
   const mid = window.innerHeight / 2;
   let best = state.pages[0], bestDist = Infinity;
   for (const p of state.pages) {
@@ -1198,25 +1268,30 @@ function currentPage() {
   return best;
 }
 
+/** Resolves null if the data URL will not decode, so we never place an invisible overlay. */
 function imageAspect(dataUrl) {
-  return new Promise((resolve) => { const i = new Image(); i.onload = () => resolve(i.width / i.height); i.onerror = () => resolve(3); i.src = dataUrl; });
+  return new Promise((resolve) => { const i = new Image(); i.onload = () => resolve(i.width / i.height); i.onerror = () => resolve(null); i.src = dataUrl; });
 }
 
 $('btn-add-signature').addEventListener('click', async () => {
+  const page = currentPage();
+  if (!page) return;
   let sig = getSavedSignature();
   if (!sig) sig = await openSignaturePad();
   if (!sig) return;
-  addOverlay('signature', currentPage(), sig, await imageAspect(sig));
+  const aspect = await imageAspect(sig);
+  if (aspect == null) { showToast('Saved signature image is unreadable — draw a new one.'); return; }
+  addOverlay('signature', page, sig, aspect);
 });
-$('btn-add-date').addEventListener('click', () => addOverlay('date', currentPage(), todayString()));
-$('btn-add-text').addEventListener('click', () => addOverlay('text', currentPage(), 'Text'));
+$('btn-add-date').addEventListener('click', () => { const page = currentPage(); if (page) addOverlay('date', page, todayString()); });
+$('btn-add-text').addEventListener('click', () => { const page = currentPage(); if (page) addOverlay('text', page, 'Text'); });
 
 export { state, todayString };
 ```
 
 - [ ] **Step 3: Verify in browser**
 
-Open a multi-page PDF, scroll to page 2, click + Signature: it appears centred on page 2, selected. Drag it; it can't leave the page. Resize keeps aspect. + Date shows today's date; toggling format then adding another date changes format. + Text → double-click → type → Enter commits. Delete key removes the selected overlay; Backspace while editing text does NOT delete the overlay. Clicking on the page background deselects. Opening a second PDF clears every overlay; a file that fails to parse leaves them alone.
+Open a multi-page PDF, scroll to page 2, click + Signature: it appears centred on page 2, selected. Drag it; it can't leave the page. Resize keeps aspect. + Date shows today's date; toggling format then adding another date changes format. + Text → double-click → type → Enter commits. Delete key removes the selected overlay; Backspace while editing text does NOT delete the overlay. Clicking on the page background deselects. Opening a second PDF clears every overlay; a file that fails to parse leaves them alone. A 25-character name widens the box to fit with nothing clipped, and resizing a text overlay taller grows the font with the width following the glyphs. Right-clicking an overlay does not start a drag, and scrolling the wheel mid-drag leaves the overlay under the pointer. Pasting multi-line text lands as one line.
 
 - [ ] **Step 4: Commit**
 
@@ -1286,10 +1361,11 @@ Rotation handling is entirely inside geometry.js (unit-tested). If Task 7's visu
 
 - [ ] **Step 2: Wire Save in app.js**
 
-Add `import { buildSignedPdf, downloadBytes, signedName } from './exporter.js';` and:
+Add `import { buildSignedPdf, downloadBytes, signedName } from './exporter.js';`, add `commitEdits` to the `overlays.js` import, and:
 
 ```js
 $('btn-save').addEventListener('click', async () => {
+  commitEdits(); // an edit still in progress must reach the model before we read it
   const overlays = getOverlays();
   if (overlays.length === 0) { showToast('Nothing to save — add a signature first.'); return; }
   $('btn-save').disabled = true;
