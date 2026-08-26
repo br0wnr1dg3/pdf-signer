@@ -282,7 +282,7 @@ git add -A && git commit -m "feat: scaffold PDF signer page, vendor pdf.js and p
 - Create: `src/geometry.js`
 - Test: `test/geometry.test.js`
 
-pdf.js renders a page with a `scale` and a `rotation` (the page's `/Rotate` value). Overlay rects are CSS px in the *rendered* (rotated) image with origin top-left, Y down. pdf-lib draws in *unrotated* page space with origin bottom-left, Y up. For text we also need a font size: the box height in points × 0.8 (so Helvetica's ascender fits inside the box), and pdf-lib's `drawText` y is the baseline, so baseline = bottom + fontSize × 0.2.
+pdf.js renders a page with a `scale` and a `rotation` (the page's `/Rotate` value). Overlay rects are CSS px in the *rendered* (rotated) image with origin top-left, Y down. pdf-lib draws in *unrotated* page space with origin bottom-left, Y up. For text we also need a font size: the box height in points × 0.8 (so Helvetica's ascender fits inside the box), and pdf-lib's `drawText` y is the baseline, so baseline = bottom + fontSize × 0.43 (calibrated against the browser preview: with `line-height:1` and the box 1.25× the font size, the CSS baseline sits ≈0.34·h above the box bottom = 0.43·fontSize).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -333,11 +333,11 @@ test('toPdfRect rejects unknown rotation', () => {
   assert.throws(() => toPdfRect({ x:0, y:0, w:1, h:1 }, { ...vp0, rotation: 45 }), /rotation/);
 });
 
-test('textLayout: font size is 80% of box height and baseline sits above the bottom', () => {
+test('textLayout: font size is 80% of box height and baseline sits 0.43·fontSize above the bottom', () => {
   const t = textLayout({ x: 10, y: 100, w: 80, h: 20 });
   close(t.fontSize, 16, 'fontSize');
   close(t.x, 10, 'x');
-  close(t.baselineY, 100 + 16 * 0.2, 'baselineY');
+  close(t.baselineY, 100 + 16 * 0.43, 'baselineY');
 });
 ```
 
@@ -379,10 +379,13 @@ export function toPdfRect(rect, viewport) {
   return { x: minX, y: minY, w: Math.max(...xs) - minX, h: Math.max(...ys) - minY };
 }
 
+/** Fraction of the font size between the box bottom and the text baseline (matches the CSS preview). */
+export const BASELINE_RATIO = 0.43;
+
 /** Given a PDF-point rect for a text box, return the font size and baseline for pdf-lib drawText. */
 export function textLayout(pdfRect) {
   const fontSize = pdfRect.h * 0.8;
-  return { fontSize, x: pdfRect.x, baselineY: pdfRect.y + fontSize * 0.2 };
+  return { fontSize, x: pdfRect.x, baselineY: pdfRect.y + fontSize * BASELINE_RATIO };
 }
 ```
 
@@ -858,7 +861,7 @@ git add src/overlays.js src/app.js && git commit -m "feat: draggable, resizable,
 - [ ] **Step 1: Implement exporter.js**
 
 ```js
-import { toPdfRect, textLayout } from './geometry.js';
+import { toPdfRect, textLayout, BASELINE_RATIO } from './geometry.js';
 
 /**
  * bytes: Uint8Array of the original PDF
@@ -907,7 +910,7 @@ function anchorForRotation(r, rotation) {
 }
 
 function textAnchorForRotation(r, t, rotation) {
-  const size = t.fontSize, pad = size * 0.2;
+  const size = t.fontSize, pad = size * BASELINE_RATIO;
   switch (rotation) {
     case 0:   return {};
     case 90:  return { x: r.x + r.w - pad, y: r.y,         size: r.w * 0.8 };
