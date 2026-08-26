@@ -5,6 +5,8 @@ Sign PDFs locally on your Mac. No accounts, no uploads, no Adobe.
 ## Run
 Double-click `open.command` (or `npm start` then visit http://localhost:8765).
 
+**Dock / Desktop shortcut:** run `./make-app.sh` once. It builds `~/Applications/PDF Signer.app` and puts an alias on your Desktop; drag the app onto the Dock to pin it. Re-run if you move this folder.
+
 ## Use
 1. Open / drop a PDF.
 2. **Sign** — draw once (or upload a PNG). It's saved in your browser for next time.
