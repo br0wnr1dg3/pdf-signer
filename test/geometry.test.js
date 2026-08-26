@@ -72,6 +72,15 @@ test('rotation 270: interior rect at scale 2', () => {
   eqRect(toPdfRect({ x: 60, y: 100, w: 80, h: 40 }, vp270s2), { x: 130, y: 330, w: 20, h: 40 });
 });
 
+// --- CropBox origin ---
+
+test('a non-zero CropBox origin shifts the result and defaults to 0', () => {
+  const rect = { x: 20, y: 40, w: 100, h: 50 };
+  const plain = toPdfRect(rect, vp0);
+  const shifted = toPdfRect(rect, { ...vp0, offsetX: 5, offsetY: 7 });
+  eqRect(shifted, { x: plain.x + 5, y: plain.y + 7, w: plain.w, h: plain.h });
+});
+
 // --- whole-page invariant ---
 
 test('a rect covering the whole rendered image is the whole page, at every rotation', () => {

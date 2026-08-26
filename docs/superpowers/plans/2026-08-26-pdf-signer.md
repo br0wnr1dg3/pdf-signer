@@ -54,7 +54,8 @@ pdf-signer/
 
 ```js
 // { scale: number, rotation: 0|90|180|270, width: number, height: number, // rendered CSS px
-//   pdfWidth: number, pdfHeight: number }                                   // unrotated page size in PDF points
+//   pdfWidth: number, pdfHeight: number,   // unrotated page size in PDF points (UserUnit assumed 1)
+//   offsetX: number, offsetY: number }     // CropBox origin in points, usually 0 — added back by toPdfRect
 ```
 
 ---
@@ -361,6 +362,15 @@ test('rotation 270: interior rect at scale 2', () => {
   eqRect(toPdfRect({ x: 60, y: 100, w: 80, h: 40 }, vp270s2), { x: 130, y: 330, w: 20, h: 40 });
 });
 
+// --- CropBox origin ---
+
+test('a non-zero CropBox origin shifts the result and defaults to 0', () => {
+  const rect = { x: 20, y: 40, w: 100, h: 50 };
+  const plain = toPdfRect(rect, vp0);
+  const shifted = toPdfRect(rect, { ...vp0, offsetX: 5, offsetY: 7 });
+  eqRect(shifted, { x: plain.x + 5, y: plain.y + 7, w: plain.w, h: plain.h });
+});
+
 // --- whole-page invariant ---
 
 test('a rect covering the whole rendered image is the whole page, at every rotation', () => {
@@ -478,11 +488,14 @@ function normalizeRotation(rotation) {
  * Convert a rect in rendered CSS pixels (origin top-left, Y down, on the ROTATED page image)
  * into unrotated PDF points (origin bottom-left, Y up) for pdf-lib.
  *
- * viewport: { scale, rotation (0|90|180|270), pdfWidth, pdfHeight } — the rendered
- * width/height are implied by scale and rotation, so they are not read here.
+ * viewport: { scale, rotation (0|90|180|270), pdfWidth, pdfHeight, offsetX?, offsetY? } — the
+ * rendered width/height are implied by scale and rotation, so they are not read here.
+ * offsetX/offsetY are the CropBox origin in points (default 0), added back at the end so the
+ * result is in PDF user space rather than relative to the visible box.
  */
 export function toPdfRect(rect, viewport) {
   const { scale, pdfWidth, pdfHeight } = viewport;
+  const offsetX = viewport.offsetX ?? 0, offsetY = viewport.offsetY ?? 0;
   if (!Number.isFinite(scale) || scale <= 0) throw new Error(`Invalid scale: ${scale}`);
   const rotation = normalizeRotation(viewport.rotation);
 
@@ -504,7 +517,8 @@ export function toPdfRect(rect, viewport) {
   const corners = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].map(mapPoint);
   const xs = corners.map(c => c[0]), ys = corners.map(c => c[1]);
   const minX = Math.min(...xs), minY = Math.min(...ys);
-  return { x: minX, y: minY, w: Math.max(...xs) - minX, h: Math.max(...ys) - minY };
+  // 3. Shift out of CropBox-relative space into PDF user space.
+  return { x: minX + offsetX, y: minY + offsetY, w: Math.max(...xs) - minX, h: Math.max(...ys) - minY };
 }
 
 /**
@@ -559,7 +573,7 @@ export function textLayout(pdfRect, rotation = 0) {
 - [ ] **Step 4: Run tests**
 
 Run: `npm test`
-Expected: all 20 tests pass. If a rotation case fails, re-derive: with rotation 90 (clockwise), the rendered image's left edge corresponds to the unrotated page's bottom edge and its top edge to the page's left edge, so `(px, py) → (py, px)`.
+Expected: all 21 tests pass. If a rotation case fails, re-derive: with rotation 90 (clockwise), the rendered image's left edge corresponds to the unrotated page's bottom edge and its top edge to the page's left edge, so `(px, py) → (py, px)`.
 
 - [ ] **Step 5: Commit**
 
@@ -583,60 +597,115 @@ import * as pdfjsLib from '../vendor/pdf.min.mjs';
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdf.worker.min.mjs', import.meta.url).href;
 
 const TARGET_WIDTH = 800; // CSS px
+const MAX_DPR = 2;        // beyond 2x the extra canvas pixels cost memory for no visible gain
+
+// pdf.js 6 has no PDFDocumentProxy.destroy(); the loading task owns teardown (and the worker),
+// so that is what we hold on to.
+let currentTask = null; // the PDFDocumentLoadingTask behind the pages on screen
+let loadSeq = 0;        // generation counter: only the newest loadPdf call may touch the container
+
+/** Destroy the document currently on screen, freeing its worker and caches. Safe to call any time. */
+export async function closePdf() {
+  const task = currentTask;
+  currentTask = null;
+  if (task) await task.destroy();
+}
 
 /**
- * Renders every page of `file` into #pages. Returns { bytes, pages } where
+ * Renders every page of `file` into `container`, one at a time, calling
+ * `onPage(pageInfo, numPages)` as each page appears. Returns { bytes, pages } where
  * pages[i] = { index, el, canvas, viewport } and viewport matches the shape in geometry.js.
+ *
+ * `viewport.offsetX/offsetY` are the CropBox origin in points, usually (0, 0), which must be
+ * added back when converting to PDF user space. UserUnit is assumed to be 1 (the default);
+ * a page that sets /UserUnit would render at the right size but export at the wrong one.
+ *
+ * Only the most recent call may write to `container`: a superseded call cancels its render and
+ * throws Error('superseded'), which the caller should ignore.
  * Throws Error('encrypted') for password-protected files, Error('invalid') otherwise.
  */
-export async function loadPdf(file, container) {
+export async function loadPdf(file, container, onPage) {
+  const seq = ++loadSeq;
+  const abortIfSuperseded = (task) => {
+    if (seq === loadSeq) return;
+    task?.cancel?.();
+    throw new Error('superseded');
+  };
+
+  await closePdf();
+
   const bytes = new Uint8Array(await file.arrayBuffer());
+  const loadingTask = pdfjsLib.getDocument({ data: bytes.slice() });
   let doc;
   try {
-    doc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+    doc = await loadingTask.promise;
   } catch (err) {
+    await loadingTask.destroy().catch(() => {});
     if (err?.name === 'PasswordException') throw new Error('encrypted');
     throw new Error('invalid');
   }
+  if (seq !== loadSeq) { await loadingTask.destroy(); throw new Error('superseded'); }
+  currentTask = loadingTask;
+
   container.innerHTML = '';
   const pages = [];
-  const dpr = window.devicePixelRatio || 1;
-  for (let i = 1; i <= doc.numPages; i++) {
-    const page = await doc.getPage(i);
-    const rotation = ((page.rotate % 360) + 360) % 360;
-    const base = page.getViewport({ scale: 1, rotation });
-    const scale = TARGET_WIDTH / base.width;
-    const vp = page.getViewport({ scale, rotation });
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+  try {
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      abortIfSuperseded();
+      const rotation = ((page.rotate % 360) + 360) % 360;
+      const base = page.getViewport({ scale: 1, rotation });
+      const scale = TARGET_WIDTH / base.width;
+      const vp = page.getViewport({ scale, rotation });
+      const unrot = page.getViewport({ scale: 1, rotation: 0 }); // unrotated page size in points
 
-    const el = document.createElement('div');
-    el.className = 'page';
-    el.dataset.page = String(i - 1);
-    el.style.width = `${vp.width}px`;
-    el.style.height = `${vp.height}px`;
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.floor(vp.width * dpr);
-    canvas.height = Math.floor(vp.height * dpr);
-    canvas.style.width = `${vp.width}px`;
-    canvas.style.height = `${vp.height}px`;
-    el.appendChild(canvas);
-    container.appendChild(el);
+      const el = document.createElement('div');
+      el.className = 'page';
+      el.dataset.page = String(i - 1);
+      el.style.width = `${vp.width}px`;
+      el.style.height = `${vp.height}px`;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(vp.width * dpr);
+      canvas.height = Math.round(vp.height * dpr);
+      canvas.style.width = `${vp.width}px`;
+      canvas.style.height = `${vp.height}px`;
+      el.appendChild(canvas);
+      container.appendChild(el);
 
-    const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+      const task = page.render({ canvasContext: ctx, viewport: vp });
+      await task.promise;
+      abortIfSuperseded(task);
+      page.cleanup();
 
-    // Unrotated page size in points:
-    const unrot = page.getViewport({ scale: 1, rotation: 0 });
-    pages.push({
-      index: i - 1, el, canvas,
-      viewport: { scale, rotation, width: vp.width, height: vp.height, pdfWidth: unrot.width, pdfHeight: unrot.height },
-    });
+      const info = {
+        index: i - 1, el, canvas,
+        viewport: {
+          scale, rotation, width: vp.width, height: vp.height,
+          pdfWidth: unrot.width, pdfHeight: unrot.height,
+          offsetX: unrot.viewBox[0], offsetY: unrot.viewBox[1],
+        },
+      };
+      pages.push(info);
+      onPage?.(info, doc.numPages);
+    }
+  } catch (err) {
+    if (seq !== loadSeq || err?.message === 'superseded') throw new Error('superseded');
+    container.innerHTML = '';
+    currentTask = null;
+    await loadingTask.destroy().catch(() => {});
+    throw new Error('invalid');
   }
   return { bytes, pages };
 }
 ```
 
-Note: pdf.js 6 transfers the `data` buffer to the worker, hence `bytes.slice()` so we keep our own copy for pdf-lib.
+Notes on the pdf.js 6 API:
+- It transfers the `data` buffer to the worker, hence `bytes.slice()` so we keep our own copy for pdf-lib.
+- `PDFDocumentProxy` has **no** `destroy()`; teardown (and terminating the worker) lives on the `PDFDocumentLoadingTask` returned by `getDocument()`, so keep the task, not just the proxy. Without this every re-open leaks a worker.
+- `page.getViewport(...)` returns a `PageViewport` whose `viewBox` is the raw CropBox array (`page.view`) and whose `width`/`height` are already multiplied by `/UserUnit`. We assume UserUnit 1 and take the CropBox origin from `viewBox[0]`/`viewBox[1]`.
 
 - [ ] **Step 2: Wire file open + drag/drop in app.js**
 
@@ -644,44 +713,86 @@ Replace `src/app.js` with:
 
 ```js
 import { showToast } from './toast.js';
-import { loadPdf } from './pdfView.js';
+import { loadPdf, closePdf } from './pdfView.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { file: null, bytes: null, pages: [] };
+const EDIT_BUTTONS = ['btn-add-signature', 'btn-add-date', 'btn-add-text', 'btn-save'];
+
+let loading = false;
+
+const setEditingEnabled = (on) => { for (const id of EDIT_BUTTONS) $(id).disabled = !on; };
+
+/** Back to "no document open": empty page list, drop zone visible, nothing to edit or save. */
+function showEmptyState() {
+  $('pages').hidden = true;
+  $('pages').innerHTML = '';
+  $('drop-zone').hidden = false;
+  $('file-name').textContent = '';
+  Object.assign(state, { file: null, bytes: null, pages: [] });
+  setEditingEnabled(false);
+}
 
 async function openFile(file) {
   if (!file) return;
+  if (loading) { showToast('Still loading the previous PDF…'); return; }
   if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
     showToast('That is not a PDF.'); return;
   }
+  loading = true;
+  // Show the page area straight away so pages appear as they render.
+  $('drop-zone').hidden = true;
+  $('pages').hidden = false;
+  $('file-name').textContent = `${file.name} — loading…`;
+  setEditingEnabled(false);
   try {
-    const { bytes, pages } = await loadPdf(file, $('pages'));
+    const { bytes, pages } = await loadPdf(file, $('pages'), (page, numPages) => {
+      $('file-name').textContent = `${file.name} — loading page ${page.index + 1}/${numPages}…`;
+    });
     Object.assign(state, { file, bytes, pages });
-    $('drop-zone').hidden = true;
-    $('pages').hidden = false;
     $('file-name').textContent = file.name;
-    for (const id of ['btn-add-signature', 'btn-add-date', 'btn-add-text', 'btn-save']) $(id).disabled = false;
+    setEditingEnabled(true);
   } catch (err) {
+    if (err?.message === 'superseded') return; // a newer load owns the container now
+    await closePdf();
+    showEmptyState();
     showToast(err.message === 'encrypted'
       ? "Couldn't open this PDF (it's password-protected)."
       : "Couldn't open this PDF (encrypted or corrupted).");
+  } finally {
+    loading = false;
   }
 }
 
 $('btn-open').addEventListener('click', () => $('file-input').click());
-$('file-input').addEventListener('change', (e) => openFile(e.target.files[0]));
+$('file-input').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  e.target.value = ''; // so re-picking the same file still fires `change`
+  openFile(file);
+});
 
+// Drag highlight via a depth counter: dragenter/dragleave also fire for every child element,
+// so a plain add/remove pair flickers as the pointer crosses the page.
 const dz = $('drop-zone');
-for (const ev of ['dragenter', 'dragover']) document.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('over'); });
-for (const ev of ['dragleave', 'drop']) document.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('over'); });
-document.addEventListener('drop', (e) => openFile(e.dataTransfer.files[0]));
+let dragDepth = 0;
+const paintDrag = () => dz.classList.toggle('over', dragDepth > 0);
+document.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; paintDrag(); });
+document.addEventListener('dragleave', (e) => { e.preventDefault(); dragDepth = Math.max(0, dragDepth - 1); paintDrag(); });
+document.addEventListener('dragover', (e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; });
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0; paintDrag();
+  const files = e.dataTransfer?.files ?? [];
+  if (files.length > 1) showToast('One PDF at a time.');
+  openFile(files[0]);
+});
 
 export { state };
 ```
 
 - [ ] **Step 3: Verify in browser**
 
-Start server, open the page, drop any PDF: pages render at 800px wide, stacked. Drop a `.txt` renamed `.pdf`: toast "Couldn't open this PDF (encrypted or corrupted)." Console must be clean of errors (a worker-load error means the `workerSrc` URL is wrong).
+Start server, open the page, drop any PDF: pages render at 800px wide, stacked, appearing one at a time while the toolbar shows `name — loading page n/N…`. Open a second PDF: its pages replace the first and the previous document's worker is destroyed. Re-pick the same file from the picker: it reloads (the input value is cleared). Drag over the page: the highlight must not flicker as the pointer crosses child elements. Drop a `.txt` renamed `.pdf`: toast "Couldn't open this PDF (encrypted or corrupted)." and the drop zone comes back. Console must be clean of errors (a worker-load error means the `workerSrc` URL is wrong).
 
 - [ ] **Step 4: Commit**
 

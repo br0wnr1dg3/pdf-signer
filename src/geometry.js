@@ -15,11 +15,14 @@ function normalizeRotation(rotation) {
  * Convert a rect in rendered CSS pixels (origin top-left, Y down, on the ROTATED page image)
  * into unrotated PDF points (origin bottom-left, Y up) for pdf-lib.
  *
- * viewport: { scale, rotation (0|90|180|270), pdfWidth, pdfHeight } — the rendered
- * width/height are implied by scale and rotation, so they are not read here.
+ * viewport: { scale, rotation (0|90|180|270), pdfWidth, pdfHeight, offsetX?, offsetY? } — the
+ * rendered width/height are implied by scale and rotation, so they are not read here.
+ * offsetX/offsetY are the CropBox origin in points (default 0), added back at the end so the
+ * result is in PDF user space rather than relative to the visible box.
  */
 export function toPdfRect(rect, viewport) {
   const { scale, pdfWidth, pdfHeight } = viewport;
+  const offsetX = viewport.offsetX ?? 0, offsetY = viewport.offsetY ?? 0;
   if (!Number.isFinite(scale) || scale <= 0) throw new Error(`Invalid scale: ${scale}`);
   const rotation = normalizeRotation(viewport.rotation);
 
@@ -41,7 +44,8 @@ export function toPdfRect(rect, viewport) {
   const corners = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].map(mapPoint);
   const xs = corners.map(c => c[0]), ys = corners.map(c => c[1]);
   const minX = Math.min(...xs), minY = Math.min(...ys);
-  return { x: minX, y: minY, w: Math.max(...xs) - minX, h: Math.max(...ys) - minY };
+  // 3. Shift out of CropBox-relative space into PDF user space.
+  return { x: minX + offsetX, y: minY + offsetY, w: Math.max(...xs) - minX, h: Math.max(...ys) - minY };
 }
 
 /**
