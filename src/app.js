@@ -1,5 +1,6 @@
 import { showToast } from './toast.js';
 import { loadPdf, closePdf } from './pdfView.js';
+import { openSignaturePad } from './signaturePad.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { file: null, bytes: null, pages: [] };
@@ -83,6 +84,11 @@ document.addEventListener('drop', (e) => {
   const files = e.dataTransfer?.files ?? [];
   if (files.length > 1) showToast('One PDF at a time.');
   openFile(files[0]);
+});
+
+$('btn-sign').addEventListener('click', async () => {
+  const sig = await openSignaturePad();
+  if (sig) showToast('Signature saved.');
 });
 
 export { state };
