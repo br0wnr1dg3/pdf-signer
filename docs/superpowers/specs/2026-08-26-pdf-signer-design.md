@@ -5,7 +5,7 @@
 
 ## Approach
 
-Single static web page (`index.html` + `app.js` + `styles.css`) with vendored libraries:
+Single static web page (`index.html` + `styles.css` + ES modules in `src/`) with vendored libraries:
 
 - **pdf.js** (`vendor/pdf.min.mjs`, `vendor/pdf.worker.min.mjs`) — renders pages to canvases.
 - **pdf-lib** (`vendor/pdf-lib.min.js`) — embeds signature PNG and text into the original PDF bytes and produces the output.
@@ -19,8 +19,8 @@ No backend, no build step, no network. Opened via `python3 -m http.server` (need
 | `pdfView.js` | Load a `File`, render each page to a `<canvas>` inside `.page` wrappers, reporting each page as it appears; expose per-page viewport (scale, rotation, rendered size, unrotated page size and CropBox origin in PDF points). Destroys the previous document (and its worker) before loading the next, and ignores superseded loads. | `loadPdf(file, container, onPage?) → {bytes, pages: [{index, el, canvas, viewport}]}`, `closePdf()` |
 | `signaturePad.js` | Modal with drawing canvas (pointer events, smoothed quadratic strokes, pen width, clear), image upload, save/cancel. Persists PNG data URL to `localStorage['pdf-signer:signature']`. | `openSignaturePad() → Promise<dataUrl|null>`, `getSavedSignature()` |
 | `overlays.js` | Create/move/resize/edit/delete overlay elements (`signature`, `date`, `text`) positioned in CSS pixels relative to a page wrapper. Keeps a model array `{id, page, type, x, y, w, h, value}`. | `addOverlay(type, pageInfo, value, imgAspect?)`, `getOverlays()`, `removeOverlay(id)`, `removeSelected()`, `clearOverlays()`, `commitEdits()`, `deselect()`, `initOverlayGlobals()` |
-| `geometry.js` | Pure functions: CSS-pixel rect on a rendered page → PDF-point rect (flip Y, divide by scale, handle page rotation 0/90/180/270). No DOM. | `toPdfRect(rect, viewport) → {x, y, w, h}` |
-| `exporter.js` | Uses pdf-lib: load original bytes, for each overlay embed PNG or draw Helvetica text at `toPdfRect(...)`, save, trigger download `<name>-signed.pdf`. | `buildSignedPdf(bytes, overlays, pages, failures?) → Uint8Array` (a per-overlay draw failure is pushed to `failures` and skipped; the rest still exports), `downloadBytes(bytes, filename)`, `signedName(original)` |
+| `geometry.js` | Pure functions: CSS-pixel rect on a rendered page → PDF-point rect (flip Y, divide by scale, handle page rotation 0/90/180/270). No DOM. | `toPdfRect(rect, viewport) → {x, y, w, h}`, `imageLayout(rect, rotation)`, `textLayout(rect, rotation)`, `BASELINE_RATIO`, `FONT_SIZE_RATIO` |
+| `exporter.js` | Uses pdf-lib: load original bytes, for each overlay embed PNG or draw Helvetica text at `toPdfRect(...)`, save, trigger download `<name>-signed.pdf`. | `buildSignedPdf(bytes, overlays, pages, failures?) → Uint8Array` (a per-overlay draw failure is pushed to `failures` and skipped; the rest still exports), `downloadBytes(bytes, filename)`, `signedName(original)`, `canEditPdf(bytes)`, `isEncryptedPdfError(err)` |
 | `app.js` | Wires UI: file input/drag-drop, toolbar buttons (Sign, Add signature, Add date, Add text, Save), keyboard (Delete removes selected overlay). | — |
 
 ## Data flow
@@ -44,6 +44,7 @@ No backend, no build step, no network. Opened via `python3 -m http.server` (need
 - A PDF that parses but fails to render → "Couldn't render this PDF." and the view falls back to the empty state (there is nothing left to show).
 - Opening a PDF while one is still rendering → "Still loading the previous PDF…" (the in-flight load is left alone). Dropping several files at once → "One PDF at a time." and the first is used.
 - No saved signature when clicking "+ Signature" → opens the signature pad first.
+- PDF with an owner password / editing restrictions (pdf.js can render it, pdf-lib cannot modify it) → toast: "This PDF has security restrictions that prevent editing."; the document is closed and the empty state restored.
 - Export failure → toast with the error message; no download. If only some overlays fail to draw (e.g. corrupt signature PNG), the PDF is still saved and the toast says "Saved signed PDF — N item(s) could not be drawn." (details in the console).
 - Large PDFs (>50 pages): pages render sequentially; UI stays responsive via `await` between pages.
 
