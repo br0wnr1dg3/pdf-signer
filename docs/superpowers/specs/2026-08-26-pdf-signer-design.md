@@ -20,7 +20,7 @@ No backend, no build step, no network. Opened via `python3 -m http.server` (need
 | `signaturePad.js` | Modal with drawing canvas (pointer events, smoothed quadratic strokes, pen width, clear), image upload, save/cancel. Persists PNG data URL to `localStorage['pdf-signer:signature']`. | `openSignaturePad() → Promise<dataUrl|null>`, `getSavedSignature()` |
 | `overlays.js` | Create/move/resize/edit/delete overlay elements (`signature`, `date`, `text`) positioned in CSS pixels relative to a page wrapper. Keeps a model array `{id, page, type, x, y, w, h, value}`. | `addOverlay(type, pageInfo, value, imgAspect?)`, `getOverlays()`, `removeOverlay(id)`, `removeSelected()`, `clearOverlays()`, `commitEdits()`, `deselect()`, `initOverlayGlobals()` |
 | `geometry.js` | Pure functions: CSS-pixel rect on a rendered page → PDF-point rect (flip Y, divide by scale, handle page rotation 0/90/180/270). No DOM. | `toPdfRect(rect, viewport) → {x, y, w, h}` |
-| `exporter.js` | Uses pdf-lib: load original bytes, for each overlay embed PNG or draw Helvetica text at `toPdfRect(...)`, save, trigger download `<name>-signed.pdf`. | `buildSignedPdf(bytes, overlays, pages) → Uint8Array`, `downloadBytes(bytes, filename)`, `signedName(original)` |
+| `exporter.js` | Uses pdf-lib: load original bytes, for each overlay embed PNG or draw Helvetica text at `toPdfRect(...)`, save, trigger download `<name>-signed.pdf`. | `buildSignedPdf(bytes, overlays, pages, failures?) → Uint8Array` (a per-overlay draw failure is pushed to `failures` and skipped; the rest still exports), `downloadBytes(bytes, filename)`, `signedName(original)` |
 | `app.js` | Wires UI: file input/drag-drop, toolbar buttons (Sign, Add signature, Add date, Add text, Save), keyboard (Delete removes selected overlay). | — |
 
 ## Data flow
@@ -44,7 +44,7 @@ No backend, no build step, no network. Opened via `python3 -m http.server` (need
 - A PDF that parses but fails to render → "Couldn't render this PDF." and the view falls back to the empty state (there is nothing left to show).
 - Opening a PDF while one is still rendering → "Still loading the previous PDF…" (the in-flight load is left alone). Dropping several files at once → "One PDF at a time." and the first is used.
 - No saved signature when clicking "+ Signature" → opens the signature pad first.
-- Export failure → toast with the error message; no download.
+- Export failure → toast with the error message; no download. If only some overlays fail to draw (e.g. corrupt signature PNG), the PDF is still saved and the toast says "Saved signed PDF — N item(s) could not be drawn." (details in the console).
 - Large PDFs (>50 pages): pages render sequentially; UI stays responsive via `await` between pages.
 
 ## Testing
