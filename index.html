@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF Signer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="toolbar">
+    <label class="btn primary">
+      Open PDF
+      <input id="file-input" type="file" accept="application/pdf" hidden />
+    </label>
+    <span class="sep"></span>
+    <button id="btn-sign" class="btn">Sign</button>
+    <button id="btn-add-signature" class="btn" disabled>+ Signature</button>
+    <button id="btn-add-date" class="btn" disabled>+ Date</button>
+    <button id="btn-add-text" class="btn" disabled>+ Text</button>
+    <button id="btn-date-format" class="btn ghost" title="Toggle date format">DD/MM/YYYY</button>
+    <span class="spacer"></span>
+    <span id="file-name" class="file-name"></span>
+    <button id="btn-save" class="btn primary" disabled>Save signed PDF</button>
+  </header>
+
+  <main id="main">
+    <div id="drop-zone" class="drop-zone">
+      <p>Drop a PDF here</p>
+      <p class="muted">or use “Open PDF”</p>
+    </div>
+    <div id="pages" class="pages" hidden></div>
+  </main>
+
+  <div id="sig-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Draw your signature</h2>
+      <canvas id="sig-canvas" width="600" height="220"></canvas>
+      <div class="modal-row">
+        <label>Pen <input id="sig-width" type="range" min="1" max="6" value="2.5" step="0.5" /></label>
+        <button id="sig-clear" class="btn ghost">Clear</button>
+        <label class="btn ghost">Upload image<input id="sig-upload" type="file" accept="image/png,image/jpeg" hidden /></label>
+        <span class="spacer"></span>
+        <button id="sig-cancel" class="btn">Cancel</button>
+        <button id="sig-save" class="btn primary">Save signature</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="vendor/pdf-lib.min.js"></script>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>

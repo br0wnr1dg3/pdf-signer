@@ -1,0 +1,10 @@
+{
+  "name": "pdf-signer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "start": "python3 -m http.server 8765",
+    "samples": "node samples/make-samples.mjs"
+  }
+}
