@@ -1,7 +1,8 @@
 import { showToast } from './toast.js';
 import { loadPdf, closePdf } from './pdfView.js';
 import { openSignaturePad, getSavedSignature } from './signaturePad.js';
-import { addOverlay, initOverlayGlobals, getOverlays, clearOverlays } from './overlays.js';
+import { addOverlay, initOverlayGlobals, getOverlays, clearOverlays, commitEdits } from './overlays.js';
+import { buildSignedPdf, downloadBytes, signedName } from './exporter.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { file: null, bytes: null, pages: [] };
@@ -139,5 +140,25 @@ $('btn-add-signature').addEventListener('click', async () => {
 });
 $('btn-add-date').addEventListener('click', () => { const page = currentPage(); if (page) addOverlay('date', page, todayString()); });
 $('btn-add-text').addEventListener('click', () => { const page = currentPage(); if (page) addOverlay('text', page, 'Text'); });
+
+$('btn-save').addEventListener('click', async () => {
+  commitEdits(); // an edit still in progress must reach the model before we read it
+  const overlays = getOverlays();
+  if (overlays.length === 0) { showToast('Nothing to save — add a signature first.'); return; }
+  $('btn-save').disabled = true;
+  try {
+    const failures = [];
+    const out = await buildSignedPdf(state.bytes, overlays, state.pages, failures);
+    downloadBytes(out, signedName(state.file.name));
+    showToast(failures.length
+      ? `Saved signed PDF — ${failures.length} item(s) could not be drawn.`
+      : 'Saved signed PDF to Downloads.');
+  } catch (err) {
+    console.error(err);
+    showToast(`Export failed: ${err.message}`);
+  } finally {
+    $('btn-save').disabled = false;
+  }
+});
 
 export { state, todayString };
