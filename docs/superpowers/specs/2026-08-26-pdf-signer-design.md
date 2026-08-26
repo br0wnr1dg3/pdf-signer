@@ -16,7 +16,7 @@ No backend, no build step, no network. Opened via `python3 -m http.server` (need
 
 | Unit | Responsibility | Interface |
 |---|---|---|
-| `pdfView.js` | Load a `File`, render each page to a `<canvas>` inside `.page` wrappers; expose per-page viewport (scale, rotation, width/height in PDF points). | `loadPdf(file) → {pages: [{index, canvas, viewport}]}` |
+| `pdfView.js` | Load a `File`, render each page to a `<canvas>` inside `.page` wrappers; expose per-page viewport (scale, rotation, width/height in PDF points). | `loadPdf(file, container) → {bytes, pages: [{index, el, canvas, viewport}]}` |
 | `signaturePad.js` | Modal with drawing canvas (pointer events, smoothed quadratic strokes, pen width, clear), image upload, save/cancel. Persists PNG data URL to `localStorage['signature']`. | `openSignaturePad() → Promise<dataUrl|null>`, `getSavedSignature()` |
 | `overlays.js` | Create/move/resize/edit/delete overlay elements (`signature`, `date`, `text`) positioned in CSS pixels relative to a page wrapper. Keeps a model array `{id, page, type, x, y, w, h, value}`. | `addOverlay(type, page)`, `getOverlays()`, `removeOverlay(id)` |
 | `geometry.js` | Pure functions: CSS-pixel rect on a rendered page → PDF-point rect (flip Y, divide by scale, handle page rotation 0/90/180/270). No DOM. | `toPdfRect(rect, viewport) → {x, y, w, h}` |
@@ -40,7 +40,7 @@ No backend, no build step, no network. Opened via `python3 -m http.server` (need
 
 ## Error handling
 
-- Password-protected or unparsable PDF → toast: "Couldn't open this PDF (encrypted or corrupted)."
+- Password-protected PDF → toast: "Couldn't open this PDF (it's password-protected)." Unparsable PDF → "Couldn't open this PDF (encrypted or corrupted)." Non-PDF file → "That is not a PDF."
 - No saved signature when clicking "+ Signature" → opens the signature pad first.
 - Export failure → toast with the error message; no download.
 - Large PDFs (>50 pages): pages render sequentially; UI stays responsive via `await` between pages.
