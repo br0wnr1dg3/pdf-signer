@@ -1,0 +1,1026 @@
+# PDF Signer Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** A zero-install, offline, single-page web app on macOS that places a hand-drawn signature, date, and text onto a PDF and downloads a signed copy.
+
+**Architecture:** Static `index.html` + ES modules in `src/`. pdf.js renders pages to canvases; DOM overlays are positioned on top of each page; on export, pdf-lib embeds the signature PNG and text into the original bytes using a pure coordinate-conversion module. No backend, no build step; a `python3 -m http.server` launcher because pdf.js needs ES modules + a worker (blocked on `file://`).
+
+**Tech Stack:** Vanilla JS (ES modules), pdfjs-dist 6.x (vendored), pdf-lib 1.17 (vendored), `node --test` for unit tests, Python 3 stdlib http.server for launching.
+
+**Spec:** `docs/superpowers/specs/2026-08-26-pdf-signer-design.md`
+
+---
+
+## File structure
+
+```
+pdf-signer/
+├── index.html               # markup: toolbar, drop zone, page container, signature modal, toast
+├── styles.css               # all styling
+├── open.command             # double-click launcher: starts http.server on :8765, opens browser
+├── package.json             # {"type":"module"}, "test": "node --test"
+├── README.md                # usage + manual test checklist
+├── vendor/
+│   ├── pdf.min.mjs          # pdfjs-dist/build/pdf.min.mjs
+│   ├── pdf.worker.min.mjs   # pdfjs-dist/build/pdf.worker.min.mjs
+│   └── pdf-lib.min.js       # pdf-lib/dist/pdf-lib.min.js (UMD → window.PDFLib)
+├── src/
+│   ├── geometry.js          # pure: CSS-pixel rect → PDF-point rect (scale, Y-flip, rotation)
+│   ├── pdfView.js           # load File → render pages into #pages, return viewports
+│   ├── signaturePad.js      # draw/upload modal, localStorage persistence
+│   ├── overlays.js          # overlay model + drag/resize/edit/delete DOM behaviour
+│   ├── exporter.js          # pdf-lib: burn overlays into PDF, trigger download
+│   ├── toast.js             # showToast(message)
+│   └── app.js               # wires everything
+├── test/
+│   └── geometry.test.js
+└── samples/
+    ├── make-samples.mjs     # generates the 3 sample PDFs with pdf-lib (node)
+    ├── portrait.pdf
+    ├── landscape.pdf
+    └── rotated90.pdf
+```
+
+**Overlay model** (used by `overlays.js` and `exporter.js`):
+
+```js
+// { id: string, page: number (0-based), type: 'signature'|'date'|'text',
+//   x: number, y: number, w: number, h: number,   // CSS px, relative to the page wrapper's top-left
+//   value: string }                                 // dataURL for signature, text otherwise
+```
+
+**Viewport info** (returned by `pdfView.js`, consumed by `geometry.js`):
+
+```js
+// { scale: number, rotation: 0|90|180|270, width: number, height: number, // rendered CSS px
+//   pdfWidth: number, pdfHeight: number }                                   // unrotated page size in PDF points
+```
+
+---
+
+### Task 1: Scaffold project, vendor libraries, launcher
+
+**Files:**
+- Create: `package.json`, `.gitignore`, `open.command`, `index.html`, `styles.css`, `src/toast.js`, `README.md`
+- Create: `vendor/pdf.min.mjs`, `vendor/pdf.worker.min.mjs`, `vendor/pdf-lib.min.js`
+
+- [ ] **Step 1: package.json and .gitignore**
+
+```json
+{
+  "name": "pdf-signer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "start": "python3 -m http.server 8765",
+    "samples": "node samples/make-samples.mjs"
+  }
+}
+```
+
+`.gitignore`:
+```
+node_modules/
+.DS_Store
+*-signed.pdf
+```
+
+- [ ] **Step 2: Vendor the libraries (one-off fetch via npm pack, then delete tarballs)**
+
+Run from the project root:
+```bash
+mkdir -p vendor /tmp/pdfsigner-vendor && cd /tmp/pdfsigner-vendor
+npm pack pdfjs-dist@6 pdf-lib@1.17.1 --silent
+tar xzf pdfjs-dist-*.tgz && tar xzf pdf-lib-*.tgz
+cp package/build/pdf.min.mjs        "$OLDPWD/vendor/pdf.min.mjs"
+cp package/build/pdf.worker.min.mjs "$OLDPWD/vendor/pdf.worker.min.mjs"
+```
+Note: both tarballs extract to `package/`; extract them one at a time:
+```bash
+cd /tmp/pdfsigner-vendor && rm -rf package && tar xzf pdf-lib-*.tgz && cp package/dist/pdf-lib.min.js "$OLDPWD/vendor/pdf-lib.min.js"; cd -
+rm -rf /tmp/pdfsigner-vendor
+ls -la vendor
+```
+Expected: three files, `pdf.min.mjs` and `pdf.worker.min.mjs` each several hundred KB, `pdf-lib.min.js` ~500 KB. Add `vendor/README.md` with one line: `pdfjs-dist 6.x (Apache-2.0), pdf-lib 1.17.1 (MIT). Vendored; see package.json versions in git history.`
+
+- [ ] **Step 3: open.command launcher**
+
+```bash
+#!/bin/bash
+# Double-click me. Starts a local server and opens the app.
+cd "$(dirname "$0")"
+PORT=8765
+if ! lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
+  python3 -m http.server $PORT >/dev/null 2>&1 &
+  sleep 0.5
+fi
+open "http://localhost:$PORT/"
+```
+Run: `chmod +x open.command`
+
+- [ ] **Step 4: index.html**
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF Signer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="toolbar">
+    <label class="btn primary">
+      Open PDF
+      <input id="file-input" type="file" accept="application/pdf" hidden />
+    </label>
+    <span class="sep"></span>
+    <button id="btn-sign" class="btn">Sign</button>
+    <button id="btn-add-signature" class="btn" disabled>+ Signature</button>
+    <button id="btn-add-date" class="btn" disabled>+ Date</button>
+    <button id="btn-add-text" class="btn" disabled>+ Text</button>
+    <button id="btn-date-format" class="btn ghost" title="Toggle date format">DD/MM/YYYY</button>
+    <span class="spacer"></span>
+    <span id="file-name" class="file-name"></span>
+    <button id="btn-save" class="btn primary" disabled>Save signed PDF</button>
+  </header>
+
+  <main id="main">
+    <div id="drop-zone" class="drop-zone">
+      <p>Drop a PDF here</p>
+      <p class="muted">or use “Open PDF”</p>
+    </div>
+    <div id="pages" class="pages" hidden></div>
+  </main>
+
+  <div id="sig-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Draw your signature</h2>
+      <canvas id="sig-canvas" width="600" height="220"></canvas>
+      <div class="modal-row">
+        <label>Pen <input id="sig-width" type="range" min="1" max="6" value="2.5" step="0.5" /></label>
+        <button id="sig-clear" class="btn ghost">Clear</button>
+        <label class="btn ghost">Upload image<input id="sig-upload" type="file" accept="image/png,image/jpeg" hidden /></label>
+        <span class="spacer"></span>
+        <button id="sig-cancel" class="btn">Cancel</button>
+        <button id="sig-save" class="btn primary">Save signature</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="vendor/pdf-lib.min.js"></script>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
+```
+
+- [ ] **Step 5: styles.css**
+
+```css
+:root { --bg:#e9ebee; --bar:#fff; --accent:#2f6fed; --text:#1c1e21; --muted:#6b7280; --border:#d1d5db; }
+* { box-sizing: border-box; }
+html, body { margin:0; height:100%; font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; color:var(--text); background:var(--bg); }
+.toolbar { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:8px; padding:10px 14px; background:var(--bar); border-bottom:1px solid var(--border); }
+.toolbar .sep { width:1px; height:22px; background:var(--border); margin:0 4px; }
+.toolbar .spacer, .modal-row .spacer { flex:1; }
+.file-name { color:var(--muted); margin-right:8px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.btn { display:inline-flex; align-items:center; gap:6px; padding:7px 12px; border:1px solid var(--border); border-radius:8px; background:#fff; cursor:pointer; font:inherit; }
+.btn:hover:not(:disabled) { background:#f3f4f6; }
+.btn:disabled { opacity:.45; cursor:default; }
+.btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+.btn.primary:hover:not(:disabled) { background:#245cd0; }
+.btn.ghost { background:transparent; }
+#main { padding:24px 16px 80px; display:flex; flex-direction:column; align-items:center; }
+.drop-zone { width:min(800px, 100%); height:60vh; display:flex; flex-direction:column; justify-content:center; align-items:center; border:2px dashed var(--border); border-radius:16px; color:var(--text); font-size:20px; background:#fff; }
+.drop-zone.over { border-color:var(--accent); background:#eef3ff; }
+.muted { color:var(--muted); font-size:14px; }
+.pages { display:flex; flex-direction:column; gap:20px; }
+.page { position:relative; background:#fff; box-shadow:0 2px 10px rgba(0,0,0,.15); }
+.page canvas { display:block; }
+.overlay { position:absolute; cursor:move; user-select:none; border:1px solid transparent; }
+.overlay.selected { border-color:var(--accent); }
+.overlay img { width:100%; height:100%; display:block; pointer-events:none; }
+.overlay.text, .overlay.date { padding:2px 4px; font-family:Helvetica, Arial, sans-serif; white-space:nowrap; overflow:hidden; outline:none; line-height:1; }
+.overlay .handle { position:absolute; right:-6px; bottom:-6px; width:12px; height:12px; background:var(--accent); border-radius:50%; cursor:nwse-resize; display:none; }
+.overlay.selected .handle { display:block; }
+.modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; z-index:50; }
+.modal[hidden] { display:none; }
+.modal-card { background:#fff; padding:20px; border-radius:14px; width:640px; max-width:95vw; }
+.modal-card h2 { margin:0 0 12px; font-size:18px; }
+#sig-canvas { width:100%; border:1px solid var(--border); border-radius:8px; background:#fff; touch-action:none; cursor:crosshair; }
+.modal-row { display:flex; align-items:center; gap:10px; margin-top:12px; }
+.toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#111827; color:#fff; padding:10px 16px; border-radius:10px; z-index:60; box-shadow:0 4px 14px rgba(0,0,0,.3); }
+.toast[hidden] { display:none; }
+```
+
+- [ ] **Step 6: src/toast.js**
+
+```js
+let timer;
+export function showToast(message, ms = 3500) {
+  const el = document.getElementById('toast');
+  el.textContent = message;
+  el.hidden = false;
+  clearTimeout(timer);
+  timer = setTimeout(() => { el.hidden = true; }, ms);
+}
+```
+
+- [ ] **Step 7: Placeholder src/app.js so the page loads without console errors**
+
+```js
+import { showToast } from './toast.js';
+console.log('PDF Signer loaded');
+```
+
+- [ ] **Step 8: README.md (usage section only; checklist added in Task 7)**
+
+```markdown
+# PDF Signer
+
+Sign PDFs locally on your Mac. No accounts, no uploads, no Adobe.
+
+## Run
+Double-click `open.command` (or `npm start` then visit http://localhost:8765).
+
+## Use
+1. Open / drop a PDF.
+2. **Sign** — draw once (or upload a PNG). It's saved in your browser for next time.
+3. **+ Signature / + Date / + Text** — drag to move, drag the blue corner to resize, double-click text to edit, `Delete` to remove.
+4. **Save signed PDF** — downloads `<name>-signed.pdf`. The original is untouched.
+
+## Tests
+`npm test`
+```
+
+- [ ] **Step 9: Verify it loads**
+
+Run: `python3 -m http.server 8765 &` then `curl -s http://localhost:8765/ | head -5`; expected `<!doctype html>`. Open http://localhost:8765 in a browser: toolbar + drop zone visible, console shows "PDF Signer loaded". Kill the server afterwards (`kill %1`).
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add -A && git commit -m "feat: scaffold PDF signer page, vendor pdf.js and pdf-lib, add launcher"
+```
+
+---
+
+### Task 2: geometry.js (pure coordinate conversion, TDD)
+
+**Files:**
+- Create: `src/geometry.js`
+- Test: `test/geometry.test.js`
+
+pdf.js renders a page with a `scale` and a `rotation` (the page's `/Rotate` value). Overlay rects are CSS px in the *rendered* (rotated) image with origin top-left, Y down. pdf-lib draws in *unrotated* page space with origin bottom-left, Y up. For text we also need a font size: the box height in points × 0.8 (so Helvetica's ascender fits inside the box), and pdf-lib's `drawText` y is the baseline, so baseline = bottom + fontSize × 0.2.
+
+- [ ] **Step 1: Write the failing tests**
+
+```js
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { toPdfRect, textLayout } from '../src/geometry.js';
+
+const close = (a, b, msg) => assert.ok(Math.abs(a - b) < 1e-6, `${msg}: ${a} vs ${b}`);
+const eqRect = (got, want) => { for (const k of ['x','y','w','h']) close(got[k], want[k], k); };
+
+// Unrotated 200x400pt page rendered at scale 2 → 400x800 css px
+const vp0 = { scale: 2, rotation: 0, width: 400, height: 800, pdfWidth: 200, pdfHeight: 400 };
+
+test('rotation 0: divides by scale and flips Y', () => {
+  // box at css (20, 40) size 100x50 → pdf x=10, top y = 400-20 = 380, bottom = 380-25 = 355
+  eqRect(toPdfRect({ x: 20, y: 40, w: 100, h: 50 }, vp0), { x: 10, y: 355, w: 50, h: 25 });
+});
+
+test('rotation 0: box at bottom-left of image maps to pdf origin', () => {
+  eqRect(toPdfRect({ x: 0, y: 700, w: 40, h: 100 }, vp0), { x: 0, y: 0, w: 20, h: 50 });
+});
+
+// Page rotated 90° clockwise: rendered image is 800x400 css px (width = pdfHeight*scale)
+const vp90 = { scale: 2, rotation: 90, width: 800, height: 400, pdfWidth: 200, pdfHeight: 400 };
+
+test('rotation 90: top-left of rendered image is bottom-left of unrotated page', () => {
+  // A 40x20 css box at rendered (0,0). In unrotated page space it sits at the bottom-left,
+  // with w/h swapped: pdf w=10 (from css h 20), h=20 (from css w 40).
+  eqRect(toPdfRect({ x: 0, y: 0, w: 40, h: 20 }, vp90), { x: 0, y: 0, w: 10, h: 20 });
+});
+
+test('rotation 90: top-right of rendered image is top-left of unrotated page', () => {
+  eqRect(toPdfRect({ x: 760, y: 0, w: 40, h: 20 }, vp90), { x: 0, y: 380, w: 10, h: 20 });
+});
+
+const vp180 = { scale: 1, rotation: 180, width: 200, height: 400, pdfWidth: 200, pdfHeight: 400 };
+test('rotation 180: top-left of rendered image is bottom-right of unrotated page', () => {
+  eqRect(toPdfRect({ x: 0, y: 0, w: 40, h: 20 }, vp180), { x: 160, y: 0, w: 40, h: 20 });
+});
+
+const vp270 = { scale: 1, rotation: 270, width: 400, height: 200, pdfWidth: 200, pdfHeight: 400 };
+test('rotation 270: top-left of rendered image is top-right of unrotated page', () => {
+  eqRect(toPdfRect({ x: 0, y: 0, w: 40, h: 20 }, vp270), { x: 180, y: 360, w: 20, h: 40 });
+});
+
+test('toPdfRect rejects unknown rotation', () => {
+  assert.throws(() => toPdfRect({ x:0, y:0, w:1, h:1 }, { ...vp0, rotation: 45 }), /rotation/);
+});
+
+test('textLayout: font size is 80% of box height and baseline sits above the bottom', () => {
+  const t = textLayout({ x: 10, y: 100, w: 80, h: 20 });
+  close(t.fontSize, 16, 'fontSize');
+  close(t.x, 10, 'x');
+  close(t.baselineY, 100 + 16 * 0.2, 'baselineY');
+});
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `npm test`
+Expected: FAIL — `Cannot find module '.../src/geometry.js'`
+
+- [ ] **Step 3: Implement**
+
+```js
+/**
+ * Convert a rect in rendered CSS pixels (origin top-left, Y down, on the ROTATED page image)
+ * into unrotated PDF points (origin bottom-left, Y up) for pdf-lib.
+ *
+ * viewport: { scale, rotation (0|90|180|270), width, height, pdfWidth, pdfHeight }
+ */
+export function toPdfRect(rect, viewport) {
+  const { scale, rotation, pdfWidth, pdfHeight } = viewport;
+  // 1. CSS px → points, still in rotated-image space with origin top-left.
+  const x = rect.x / scale, y = rect.y / scale, w = rect.w / scale, h = rect.h / scale;
+  // Rotated image size in points:
+  const rw = (rotation === 90 || rotation === 270) ? pdfHeight : pdfWidth;
+  const rh = (rotation === 90 || rotation === 270) ? pdfWidth : pdfHeight;
+
+  // 2. Map the rect's corners from rotated top-left space to unrotated bottom-left space.
+  // Work with the rect's four corners so w/h swap falls out naturally.
+  const corners = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].map(([px, py]) => {
+    switch (rotation) {
+      case 0:   return [px, rh - py];
+      case 90:  return [py, px];                 // image-left edge = page-bottom, image-top edge = page-left
+      case 180: return [rw - px, py];
+      case 270: return [rh - py, rw - px];
+      default:  throw new Error(`Unsupported page rotation: ${rotation}`);
+    }
+  });
+  const xs = corners.map(c => c[0]), ys = corners.map(c => c[1]);
+  const minX = Math.min(...xs), minY = Math.min(...ys);
+  return { x: minX, y: minY, w: Math.max(...xs) - minX, h: Math.max(...ys) - minY };
+}
+
+/** Given a PDF-point rect for a text box, return the font size and baseline for pdf-lib drawText. */
+export function textLayout(pdfRect) {
+  const fontSize = pdfRect.h * 0.8;
+  return { fontSize, x: pdfRect.x, baselineY: pdfRect.y + fontSize * 0.2 };
+}
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `npm test`
+Expected: all 8 tests pass. If a rotation case fails, re-derive: with rotation 90 (clockwise), the rendered image's left edge corresponds to the unrotated page's bottom edge and its top edge to the page's left edge, so `(px, py) → (py, px)`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/geometry.js test/geometry.test.js && git commit -m "feat: geometry conversion from rendered px to PDF points with rotation"
+```
+
+---
+
+### Task 3: pdfView.js — render pages
+
+**Files:**
+- Create: `src/pdfView.js`
+- Modify: `src/app.js`
+
+- [ ] **Step 1: Implement pdfView.js**
+
+```js
+import * as pdfjsLib from '../vendor/pdf.min.mjs';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdf.worker.min.mjs', import.meta.url).href;
+
+const TARGET_WIDTH = 800; // CSS px
+
+/**
+ * Renders every page of `file` into #pages. Returns { bytes, pages } where
+ * pages[i] = { index, el, canvas, viewport } and viewport matches the shape in geometry.js.
+ * Throws Error('encrypted') for password-protected files, Error('invalid') otherwise.
+ */
+export async function loadPdf(file, container) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let doc;
+  try {
+    doc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+  } catch (err) {
+    if (err?.name === 'PasswordException') throw new Error('encrypted');
+    throw new Error('invalid');
+  }
+  container.innerHTML = '';
+  const pages = [];
+  const dpr = window.devicePixelRatio || 1;
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const rotation = ((page.rotate % 360) + 360) % 360;
+    const base = page.getViewport({ scale: 1, rotation });
+    const scale = TARGET_WIDTH / base.width;
+    const vp = page.getViewport({ scale, rotation });
+
+    const el = document.createElement('div');
+    el.className = 'page';
+    el.dataset.page = String(i - 1);
+    el.style.width = `${vp.width}px`;
+    el.style.height = `${vp.height}px`;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.floor(vp.width * dpr);
+    canvas.height = Math.floor(vp.height * dpr);
+    canvas.style.width = `${vp.width}px`;
+    canvas.style.height = `${vp.height}px`;
+    el.appendChild(canvas);
+    container.appendChild(el);
+
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+
+    // Unrotated page size in points:
+    const unrot = page.getViewport({ scale: 1, rotation: 0 });
+    pages.push({
+      index: i - 1, el, canvas,
+      viewport: { scale, rotation, width: vp.width, height: vp.height, pdfWidth: unrot.width, pdfHeight: unrot.height },
+    });
+  }
+  return { bytes, pages };
+}
+```
+
+Note: pdf.js 6 transfers the `data` buffer to the worker, hence `bytes.slice()` so we keep our own copy for pdf-lib.
+
+- [ ] **Step 2: Wire file open + drag/drop in app.js**
+
+Replace `src/app.js` with:
+
+```js
+import { showToast } from './toast.js';
+import { loadPdf } from './pdfView.js';
+
+const $ = (id) => document.getElementById(id);
+const state = { file: null, bytes: null, pages: [] };
+
+async function openFile(file) {
+  if (!file) return;
+  if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
+    showToast('That is not a PDF.'); return;
+  }
+  try {
+    const { bytes, pages } = await loadPdf(file, $('pages'));
+    Object.assign(state, { file, bytes, pages });
+    $('drop-zone').hidden = true;
+    $('pages').hidden = false;
+    $('file-name').textContent = file.name;
+    for (const id of ['btn-add-signature', 'btn-add-date', 'btn-add-text', 'btn-save']) $(id).disabled = false;
+  } catch (err) {
+    showToast(err.message === 'encrypted'
+      ? "Couldn't open this PDF (it's password-protected)."
+      : "Couldn't open this PDF (encrypted or corrupted).");
+  }
+}
+
+$('file-input').addEventListener('change', (e) => openFile(e.target.files[0]));
+
+const dz = $('drop-zone');
+for (const ev of ['dragenter', 'dragover']) document.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('over'); });
+for (const ev of ['dragleave', 'drop']) document.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('over'); });
+document.addEventListener('drop', (e) => openFile(e.dataTransfer.files[0]));
+
+export { state };
+```
+
+- [ ] **Step 3: Verify in browser**
+
+Start server, open the page, drop any PDF: pages render at 800px wide, stacked. Drop a `.txt` renamed `.pdf`: toast "Couldn't open this PDF (encrypted or corrupted)." Console must be clean of errors (a worker-load error means the `workerSrc` URL is wrong).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/pdfView.js src/app.js && git commit -m "feat: render PDF pages with pdf.js, file open and drag-drop"
+```
+
+---
+
+### Task 4: signaturePad.js — draw / upload / persist
+
+**Files:**
+- Create: `src/signaturePad.js`
+- Modify: `src/app.js`
+
+- [ ] **Step 1: Implement signaturePad.js**
+
+```js
+const KEY = 'pdf-signer:signature';
+
+export function getSavedSignature() {
+  return localStorage.getItem(KEY);
+}
+
+/**
+ * Opens the modal. Resolves with a PNG data URL (also persisted) or null if cancelled.
+ */
+export function openSignaturePad() {
+  const modal = document.getElementById('sig-modal');
+  const canvas = document.getElementById('sig-canvas');
+  const ctx = canvas.getContext('2d');
+  const widthInput = document.getElementById('sig-width');
+  let hasInk = false;
+  let uploaded = null; // data URL from upload, if any
+
+  const clear = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); hasInk = false; uploaded = null; };
+  clear();
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = '#111';
+
+  // Pointer → canvas coords (canvas is CSS-scaled)
+  const pos = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * canvas.width / r.width, y: (e.clientY - r.top) * canvas.height / r.height };
+  };
+
+  let drawing = false, last = null, prevMid = null;
+  const down = (e) => { drawing = true; last = pos(e); prevMid = last; canvas.setPointerCapture(e.pointerId); };
+  const move = (e) => {
+    if (!drawing) return;
+    const p = pos(e);
+    const mid = { x: (last.x + p.x) / 2, y: (last.y + p.y) / 2 };
+    ctx.lineWidth = parseFloat(widthInput.value) * (canvas.width / canvas.getBoundingClientRect().width);
+    ctx.beginPath(); ctx.moveTo(prevMid.x, prevMid.y); ctx.quadraticCurveTo(last.x, last.y, mid.x, mid.y); ctx.stroke();
+    last = p; prevMid = mid; hasInk = true; uploaded = null;
+  };
+  const up = () => { drawing = false; };
+
+  const onUpload = (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const s = Math.min(canvas.width / img.width, canvas.height / img.height);
+        const w = img.width * s, h = img.height * s;
+        ctx.drawImage(img, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+        hasInk = true; uploaded = canvas.toDataURL('image/png');
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(f);
+    e.target.value = '';
+  };
+
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      canvas.removeEventListener('pointerdown', down); canvas.removeEventListener('pointermove', move);
+      canvas.removeEventListener('pointerup', up); canvas.removeEventListener('pointercancel', up);
+      document.getElementById('sig-clear').onclick = null;
+      document.getElementById('sig-upload').onchange = null;
+      document.getElementById('sig-cancel').onclick = null;
+      document.getElementById('sig-save').onclick = null;
+      modal.hidden = true;
+    };
+    canvas.addEventListener('pointerdown', down); canvas.addEventListener('pointermove', move);
+    canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
+    document.getElementById('sig-clear').onclick = clear;
+    document.getElementById('sig-upload').onchange = onUpload;
+    document.getElementById('sig-cancel').onclick = () => { cleanup(); resolve(null); };
+    document.getElementById('sig-save').onclick = () => {
+      if (!hasInk) return;
+      const dataUrl = uploaded ?? trimmedPng(canvas);
+      localStorage.setItem(KEY, dataUrl);
+      cleanup(); resolve(dataUrl);
+    };
+    modal.hidden = false;
+  });
+}
+
+/** Crop transparent margins so the saved signature has a tight bounding box. */
+function trimmedPng(canvas) {
+  const ctx = canvas.getContext('2d');
+  const { width, height } = canvas;
+  const data = ctx.getImageData(0, 0, width, height).data;
+  let minX = width, minY = height, maxX = -1, maxY = -1;
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    if (data[(y * width + x) * 4 + 3] > 0) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  }
+  if (maxX < 0) return canvas.toDataURL('image/png');
+  const pad = 6;
+  const sx = Math.max(0, minX - pad), sy = Math.max(0, minY - pad);
+  const sw = Math.min(width, maxX + pad) - sx, sh = Math.min(height, maxY + pad) - sy;
+  const out = document.createElement('canvas'); out.width = sw; out.height = sh;
+  out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  return out.toDataURL('image/png');
+}
+```
+
+- [ ] **Step 2: Wire the Sign button in app.js**
+
+Add to `src/app.js` (below the imports add `import { openSignaturePad } from './signaturePad.js';`, and at the bottom):
+
+```js
+$('btn-sign').addEventListener('click', async () => {
+  const sig = await openSignaturePad();
+  if (sig) showToast('Signature saved.');
+});
+```
+
+- [ ] **Step 3: Verify in browser**
+
+Click Sign → draw → Save: toast appears; `localStorage.getItem('pdf-signer:signature')` in DevTools starts with `data:image/png`. Cancel resolves without saving. Upload a PNG: it appears fitted in the canvas and saving stores it. Strokes must be smooth with no gaps at fast trackpad speed.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/signaturePad.js src/app.js && git commit -m "feat: signature pad with draw, upload, trim and localStorage persistence"
+```
+
+---
+
+### Task 5: overlays.js — place, drag, resize, edit, delete
+
+**Files:**
+- Create: `src/overlays.js`
+- Modify: `src/app.js`
+
+- [ ] **Step 1: Implement overlays.js**
+
+```js
+const overlays = [];   // model, see plan header
+let selectedId = null;
+let nextId = 1;
+
+export function getOverlays() { return overlays.map(o => ({ ...o })); }
+
+export function removeOverlay(id) {
+  const i = overlays.findIndex(o => o.id === id);
+  if (i < 0) return;
+  overlays[i].el.remove();
+  overlays.splice(i, 1);
+  if (selectedId === id) selectedId = null;
+}
+
+export function removeSelected() { if (selectedId) removeOverlay(selectedId); }
+
+/**
+ * type: 'signature' | 'date' | 'text'
+ * pageInfo: { index, el, viewport } from pdfView
+ * value: dataURL for signature, initial text otherwise
+ * imgAspect: width/height of the signature image (signature only)
+ */
+export function addOverlay(type, pageInfo, value, imgAspect = 3) {
+  const pw = pageInfo.viewport.width, ph = pageInfo.viewport.height;
+  let w, h;
+  if (type === 'signature') { w = Math.min(180, pw * 0.4); h = w / imgAspect; }
+  else { h = 22; w = type === 'date' ? 110 : 160; }
+  const o = { id: `o${nextId++}`, page: pageInfo.index, type, x: (pw - w) / 2, y: (ph - h) / 2, w, h, value, aspect: imgAspect };
+
+  const el = document.createElement('div');
+  el.className = `overlay ${type}`;
+  el.dataset.id = o.id;
+  if (type === 'signature') {
+    const img = document.createElement('img'); img.src = value; img.draggable = false; el.appendChild(img);
+  } else {
+    el.contentEditable = 'false';
+    el.textContent = value;
+    el.spellcheck = false;
+  }
+  const handle = document.createElement('div'); handle.className = 'handle'; el.appendChild(handle);
+  pageInfo.el.appendChild(el);
+  o.el = el;
+  overlays.push(o);
+  layout(o);
+  attach(o, handle);
+  select(o.id);
+  return o.id;
+}
+
+function layout(o) {
+  Object.assign(o.el.style, { left: `${o.x}px`, top: `${o.y}px`, width: `${o.w}px`, height: `${o.h}px` });
+  if (o.type !== 'signature') o.el.style.fontSize = `${o.h * 0.8}px`;
+}
+
+function select(id) {
+  selectedId = id;
+  for (const o of overlays) o.el.classList.toggle('selected', o.id === id);
+}
+export function deselect() { select(null); }
+
+function attach(o, handle) {
+  const clamp = () => {
+    const pw = o.el.parentElement.clientWidth, ph = o.el.parentElement.clientHeight;
+    o.x = Math.max(0, Math.min(o.x, pw - o.w));
+    o.y = Math.max(0, Math.min(o.y, ph - o.h));
+  };
+
+  // Drag to move
+  o.el.addEventListener('pointerdown', (e) => {
+    if (e.target === handle) return;
+    if (o.el.contentEditable === 'true') return; // editing text: let the caret work
+    e.preventDefault();
+    select(o.id);
+    const sx = e.clientX - o.x, sy = e.clientY - o.y;
+    const move = (ev) => { o.x = ev.clientX - sx; o.y = ev.clientY - sy; clamp(); layout(o); };
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+  });
+
+  // Drag handle to resize
+  handle.addEventListener('pointerdown', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    select(o.id);
+    const sx = e.clientX, sy = e.clientY, sw = o.w, sh = o.h;
+    const move = (ev) => {
+      if (o.type === 'signature') { o.w = Math.max(30, sw + (ev.clientX - sx)); o.h = o.w / o.aspect; }
+      else { o.h = Math.max(10, sh + (ev.clientY - sy)); o.w = Math.max(30, sw + (ev.clientX - sx)); }
+      clamp(); layout(o);
+    };
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+  });
+
+  // Double-click to edit text
+  if (o.type !== 'signature') {
+    o.el.addEventListener('dblclick', () => {
+      o.el.contentEditable = 'true'; o.el.focus();
+      document.getSelection()?.selectAllChildren(o.el);
+    });
+    o.el.addEventListener('blur', () => {
+      o.el.contentEditable = 'false';
+      o.value = o.el.textContent.trim() || o.value;
+      o.el.textContent = o.value;
+    });
+    o.el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); o.el.blur(); } e.stopPropagation(); });
+  }
+}
+
+/** Call once. Handles global deselect click and Delete/Backspace. */
+export function initOverlayGlobals() {
+  document.addEventListener('pointerdown', (e) => { if (!e.target.closest('.overlay')) deselect(); });
+  document.addEventListener('keydown', (e) => {
+    if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId && document.activeElement?.contentEditable !== 'true') {
+      e.preventDefault(); removeSelected();
+    }
+  });
+}
+```
+
+- [ ] **Step 2: Wire buttons in app.js**
+
+Add imports: `import { addOverlay, initOverlayGlobals, getOverlays } from './overlays.js';` and `import { getSavedSignature } from './signaturePad.js';` (merge with the existing signaturePad import). Add:
+
+```js
+initOverlayGlobals();
+
+const DATE_KEY = 'pdf-signer:dateFormat';
+let dateFormat = localStorage.getItem(DATE_KEY) || 'DMY';
+const fmtBtn = $('btn-date-format');
+const renderFmt = () => { fmtBtn.textContent = dateFormat === 'DMY' ? 'DD/MM/YYYY' : 'MM/DD/YYYY'; };
+renderFmt();
+fmtBtn.addEventListener('click', () => { dateFormat = dateFormat === 'DMY' ? 'MDY' : 'DMY'; localStorage.setItem(DATE_KEY, dateFormat); renderFmt(); });
+
+export function todayString() {
+  const d = new Date();
+  const dd = String(d.getDate()).padStart(2, '0'), mm = String(d.getMonth() + 1).padStart(2, '0'), yyyy = d.getFullYear();
+  return dateFormat === 'DMY' ? `${dd}/${mm}/${yyyy}` : `${mm}/${dd}/${yyyy}`;
+}
+
+/** The page whose centre is nearest the viewport centre. */
+function currentPage() {
+  const mid = window.innerHeight / 2;
+  let best = state.pages[0], bestDist = Infinity;
+  for (const p of state.pages) {
+    const r = p.el.getBoundingClientRect();
+    const d = Math.abs((r.top + r.bottom) / 2 - mid);
+    if (d < bestDist) { best = p; bestDist = d; }
+  }
+  return best;
+}
+
+function imageAspect(dataUrl) {
+  return new Promise((resolve) => { const i = new Image(); i.onload = () => resolve(i.width / i.height); i.src = dataUrl; });
+}
+
+$('btn-add-signature').addEventListener('click', async () => {
+  let sig = getSavedSignature();
+  if (!sig) sig = await openSignaturePad();
+  if (!sig) return;
+  addOverlay('signature', currentPage(), sig, await imageAspect(sig));
+});
+$('btn-add-date').addEventListener('click', () => addOverlay('date', currentPage(), todayString()));
+$('btn-add-text').addEventListener('click', () => addOverlay('text', currentPage(), 'Text'));
+```
+
+- [ ] **Step 3: Verify in browser**
+
+Open a multi-page PDF, scroll to page 2, click + Signature: it appears centred on page 2, selected. Drag it; it can't leave the page. Resize keeps aspect. + Date shows today's date; toggling format then adding another date changes format. + Text → double-click → type → Enter commits. Delete key removes the selected overlay; Backspace while editing text does NOT delete the overlay. Clicking on the page background deselects.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/overlays.js src/app.js && git commit -m "feat: draggable, resizable, editable overlays for signature, date and text"
+```
+
+---
+
+### Task 6: exporter.js — burn overlays into the PDF
+
+**Files:**
+- Create: `src/exporter.js`
+- Modify: `src/app.js`
+
+- [ ] **Step 1: Implement exporter.js**
+
+```js
+import { toPdfRect, textLayout } from './geometry.js';
+
+/**
+ * bytes: Uint8Array of the original PDF
+ * overlays: from getOverlays()
+ * pages: from loadPdf (need .viewport per index)
+ * Returns Uint8Array of the signed PDF.
+ */
+export async function buildSignedPdf(bytes, overlays, pages) {
+  const { PDFDocument, StandardFonts, rgb } = window.PDFLib;
+  const doc = await PDFDocument.load(bytes, { ignoreEncryption: false });
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const pdfPages = doc.getPages();
+  const imageCache = new Map();
+
+  for (const o of overlays) {
+    const page = pdfPages[o.page];
+    const vp = pages[o.page].viewport;
+    const r = toPdfRect({ x: o.x, y: o.y, w: o.w, h: o.h }, vp);
+    if (o.type === 'signature') {
+      let img = imageCache.get(o.value);
+      if (!img) { img = await doc.embedPng(o.value); imageCache.set(o.value, img); }
+      page.drawImage(img, { x: r.x, y: r.y, width: r.w, height: r.h, rotate: window.PDFLib.degrees(vp.rotation) , ...anchorForRotation(r, vp.rotation) });
+    } else {
+      const t = textLayout(r);
+      const opts = { x: t.x, y: t.baselineY, size: t.fontSize, font, color: rgb(0, 0, 0), rotate: window.PDFLib.degrees(vp.rotation) };
+      Object.assign(opts, textAnchorForRotation(r, t, vp.rotation));
+      page.drawText(o.value, opts);
+    }
+  }
+  return doc.save();
+}
+
+/**
+ * pdf-lib rotates images/text about their (x, y) anchor. For rotated pages the content
+ * must be rotated to match the page's /Rotate so it reads upright on screen, which
+ * changes which corner of the target rect is the anchor.
+ * For rotation 0 the anchor is bottom-left (default) so we return {}.
+ */
+function anchorForRotation(r, rotation) {
+  switch (rotation) {
+    case 0:   return {};
+    case 90:  return { x: r.x + r.w, y: r.y,        width: r.h, height: r.w };
+    case 180: return { x: r.x + r.w, y: r.y + r.h };
+    case 270: return { x: r.x,       y: r.y + r.h,  width: r.h, height: r.w };
+  }
+}
+
+function textAnchorForRotation(r, t, rotation) {
+  const size = t.fontSize, pad = size * 0.2;
+  switch (rotation) {
+    case 0:   return {};
+    case 90:  return { x: r.x + r.w - pad, y: r.y,         size: r.w * 0.8 };
+    case 180: return { x: r.x + r.w,       y: r.y + r.h - pad };
+    case 270: return { x: r.x + pad,       y: r.y + r.h,   size: r.w * 0.8 };
+  }
+}
+
+export function downloadBytes(bytes, filename) {
+  const blob = new Blob([bytes], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function signedName(original) {
+  return original.replace(/\.pdf$/i, '') + '-signed.pdf';
+}
+```
+
+Rotation note for the implementer: on a page with `/Rotate 90`, the viewer turns the page 90° clockwise. `toPdfRect` already gives the target rect in unrotated space (with w/h swapped for 90/270). For the drawn content to read upright in the viewer it must be drawn rotated by the same 90°; pdf-lib rotates counter-clockwise about the anchor, so the anchor becomes the bottom-right corner of the unrotated rect with `width = r.h`, `height = r.w` — that is what `anchorForRotation` returns. Verify visually with `samples/rotated90.pdf` (Task 7); if the signature lands mirrored/off-page, the anchor corner is wrong — try the other three corners rather than changing `geometry.js` (which is unit-tested).
+
+- [ ] **Step 2: Wire Save in app.js**
+
+Add `import { buildSignedPdf, downloadBytes, signedName } from './exporter.js';` and:
+
+```js
+$('btn-save').addEventListener('click', async () => {
+  const overlays = getOverlays();
+  if (overlays.length === 0) { showToast('Nothing to save — add a signature first.'); return; }
+  $('btn-save').disabled = true;
+  try {
+    const out = await buildSignedPdf(state.bytes, overlays, state.pages);
+    downloadBytes(out, signedName(state.file.name));
+    showToast('Saved signed PDF to Downloads.');
+  } catch (err) {
+    console.error(err);
+    showToast(`Export failed: ${err.message}`);
+  } finally {
+    $('btn-save').disabled = false;
+  }
+});
+```
+
+- [ ] **Step 3: Verify in browser**
+
+Place a signature, a date and a text on page 1 of any portrait PDF; Save. Open `~/Downloads/<name>-signed.pdf` in Preview: items appear exactly where placed, same size, signature transparent background, text is black Helvetica. Original file unchanged (check its mtime).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/exporter.js src/app.js && git commit -m "feat: export signed PDF with pdf-lib"
+```
+
+---
+
+### Task 7: Sample PDFs, rotation verification, README checklist
+
+**Files:**
+- Create: `samples/make-samples.mjs`, `samples/portrait.pdf`, `samples/landscape.pdf`, `samples/rotated90.pdf`
+- Modify: `README.md`, `src/exporter.js` (only if rotated output is wrong)
+
+- [ ] **Step 1: Sample generator (uses the vendored pdf-lib UMD bundle from node)**
+
+```js
+// node samples/make-samples.mjs
+import { createRequire } from 'node:module';
+import { writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+const require = createRequire(import.meta.url);
+const { PDFDocument, StandardFonts, degrees } = require('../vendor/pdf-lib.min.js');
+const here = dirname(fileURLToPath(import.meta.url));
+
+async function make(name, { width, height, rotate = 0, pages = 2 }) {
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  for (let i = 1; i <= pages; i++) {
+    const p = doc.addPage([width, height]);
+    if (rotate) p.setRotation(degrees(rotate));
+    p.drawText(`${name} — page ${i}`, { x: 40, y: height - 60, size: 20, font });
+    p.drawText('Signature: ______________________   Date: __________', { x: 40, y: 80, size: 12, font });
+    p.drawRectangle({ x: 20, y: 20, width: width - 40, height: height - 40, borderWidth: 1 });
+  }
+  writeFileSync(join(here, `${name}.pdf`), await doc.save());
+  console.log('wrote', `${name}.pdf`);
+}
+
+await make('portrait', { width: 595, height: 842 });
+await make('landscape', { width: 842, height: 595 });
+await make('rotated90', { width: 595, height: 842, rotate: 90 });
+```
+
+Run: `npm run samples` → three PDFs written. Open `rotated90.pdf` in Preview: it should display landscape with the text rotated (reading top-to-bottom). That is the intended tricky case.
+
+- [ ] **Step 2: Verify rotated export**
+
+In the app, open `samples/rotated90.pdf`, place a signature over the "Signature:" line, and a date over "Date:", save, open in Preview. The items must sit on those lines, upright relative to the page text. If not, adjust the anchor corner in `anchorForRotation`/`textAnchorForRotation` in `src/exporter.js` (see rotation note in Task 6) until correct, and re-test 0° with `portrait.pdf` to be sure nothing regressed. Do the same with `landscape.pdf` (rotation 0, wide page).
+
+- [ ] **Step 3: README manual checklist**
+
+Append to `README.md`:
+
+```markdown
+## Manual test checklist
+Run `npm run samples` first.
+
+| # | Steps | Expected |
+|---|-------|----------|
+| 1 | Open `samples/portrait.pdf` | Two pages render, 800px wide |
+| 2 | Sign → draw → Save | Toast "Signature saved."; survives reload |
+| 3 | Scroll to page 2, + Signature | Appears centred on page 2, selected |
+| 4 | Drag to a corner; drag past edge | Stays inside the page |
+| 5 | Resize via blue handle | Aspect ratio preserved |
+| 6 | + Date, toggle format, + Date again | Two dates, different formats |
+| 7 | + Text, double-click, type "Chris", Enter | Text updated; Backspace while editing does not delete box |
+| 8 | Select overlay, press Delete | Removed |
+| 9 | Save signed PDF, open in Preview | Items at placed positions/sizes; original untouched |
+| 10 | Repeat 3–9 with `samples/landscape.pdf` | Same |
+| 11 | Repeat 3–9 with `samples/rotated90.pdf` | Items upright and correctly placed |
+| 12 | Open a password-protected PDF | Toast: password-protected message |
+| 13 | Open a 60+ page PDF | Renders progressively; UI stays responsive |
+```
+
+- [ ] **Step 4: Run unit tests one last time, commit**
+
+Run: `npm test` → all pass.
+
+```bash
+git add -A && git commit -m "feat: sample PDFs, rotation verification and manual test checklist"
+```
